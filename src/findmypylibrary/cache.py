@@ -1,16 +1,36 @@
-"""Local sqlite cache holding the offline PyPI snapshot."""
+"""Local sqlite snapshot: package metadata plus a full-text (FTS5) index.
+
+The FTS5 index ships inside the snapshot, so queries never rebuild an index.
+It uses the porter stemmer ("images" matches "imaging", "plot" matches
+"plotting") and is contentless: long description text is searchable but not
+stored, which keeps the snapshot small.
+"""
+
 from __future__ import annotations
 
 import os
 import sqlite3
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
+# Bump whenever the tables below change shape. The prebuilt snapshot's file
+# name carries this number, so an old client never downloads a newer layout.
+SCHEMA_VERSION = 2
+
+# bm25 column weights, in packages_fts column order:
+# name, summary, keywords, topics, description
+FTS_WEIGHTS = (8.0, 5.0, 4.0, 3.0, 1.0)
+CORE_COLUMNS = ("name", "summary", "keywords", "topics")
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS packages (
-    name TEXT PRIMARY KEY,
+    id INTEGER PRIMARY KEY,
+    name TEXT UNIQUE NOT NULL,
     summary TEXT,
     keywords TEXT,
+    topics TEXT,
     homepage TEXT,
     version TEXT,
     last_release TEXT,
@@ -21,7 +41,17 @@ CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY,
     value TEXT
 );
+CREATE VIRTUAL TABLE IF NOT EXISTS packages_fts USING fts5(
+    name, summary, keywords, topics, description,
+    content='', tokenize='porter unicode61'
+);
 """
+
+REFRESH_HINT = "Run 'findmypylibrary refresh' to download a fresh one."
+
+
+class SnapshotError(Exception):
+    """The local snapshot is missing, corrupt, empty or from another schema version."""
 
 
 def cache_dir() -> Path:
@@ -39,55 +69,146 @@ def exists() -> bool:
     return db_path().exists()
 
 
-def _connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(db_path())
-    conn.executescript(SCHEMA)
-    return conn
+@contextmanager
+def _open_snapshot(path: Path) -> Iterator[sqlite3.Connection]:
+    """Open a snapshot read-only, raising SnapshotError unless it is usable."""
+    if not path.exists():
+        raise SnapshotError(f"No local snapshot yet. {REFRESH_HINT}")
+    # A plain connection made read-only by pragma. Opening with a "?mode=ro" URI
+    # instead makes a concurrent refresh fail with SQLITE_IOERR_LOCK.
+    conn = sqlite3.connect(path)
+    try:
+        conn.row_factory = sqlite3.Row
+        try:
+            conn.execute("PRAGMA query_only = ON")
+            row = conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
+        except sqlite3.DatabaseError as exc:
+            raise SnapshotError(f"The local snapshot is unreadable. {REFRESH_HINT}") from exc
+        if row is None or row["value"] != str(SCHEMA_VERSION):
+            raise SnapshotError(
+                f"The local snapshot was built for a different version. {REFRESH_HINT}"
+            )
+        yield conn
+    finally:
+        conn.close()
+
+
+def validate_snapshot(path: Path) -> None:
+    """Raise SnapshotError unless path is a non-empty snapshot this version can read."""
+    with _open_snapshot(path) as conn:
+        count = conn.execute("SELECT COUNT(*) FROM packages").fetchone()[0]
+    if count == 0:
+        raise SnapshotError(f"The snapshot is empty. {REFRESH_HINT}")
+
+
+def _is_compatible(path: Path) -> bool:
+    try:
+        with _open_snapshot(path):
+            return True
+    except SnapshotError:
+        return False
 
 
 def save_packages(results: list[dict]) -> None:
-    """Replace the cached snapshot with a fresh set of packages."""
-    conn = _connect()
+    """Replace the snapshot (rows and full-text index) in one transaction."""
+    path = db_path()
+    if path.exists() and not _is_compatible(path):
+        path.unlink()
+
+    conn = sqlite3.connect(path, isolation_level=None)
     try:
-        with conn:
+        conn.executescript(SCHEMA)
+        conn.execute("BEGIN IMMEDIATE")
+        try:
             conn.execute("DELETE FROM packages")
+            conn.execute("INSERT INTO packages_fts(packages_fts) VALUES ('delete-all')")
+            for row_id, pkg in enumerate(results, 1):
+                conn.execute(
+                    """
+                    INSERT INTO packages
+                        (id, name, summary, keywords, topics, homepage, version,
+                         last_release, download_count, rank)
+                    VALUES
+                        (:id, :name, :summary, :keywords, :topics, :homepage, :version,
+                         :last_release, :download_count, :rank)
+                    """,
+                    {**pkg, "id": row_id},
+                )
+                conn.execute(
+                    """
+                    INSERT INTO packages_fts
+                        (rowid, name, summary, keywords, topics, description)
+                    VALUES (:id, :name, :summary, :keywords, :topics, :description)
+                    """,
+                    {**pkg, "id": row_id},
+                )
+            meta = {
+                "schema_version": str(SCHEMA_VERSION),
+                "refreshed_at": datetime.now(timezone.utc).isoformat(),
+                "count": str(len(results)),
+            }
             conn.executemany(
-                """
-                INSERT INTO packages
-                    (name, summary, keywords, homepage, version,
-                     last_release, download_count, rank)
-                VALUES
-                    (:name, :summary, :keywords, :homepage, :version,
-                     :last_release, :download_count, :rank)
-                """,
-                results,
+                "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", list(meta.items())
             )
-            conn.execute(
-                "INSERT OR REPLACE INTO meta (key, value) VALUES ('refreshed_at', ?)",
-                (datetime.now(timezone.utc).isoformat(),),
-            )
-            conn.execute(
-                "INSERT OR REPLACE INTO meta (key, value) VALUES ('count', ?)",
-                (str(len(results)),),
-            )
+            conn.execute("COMMIT")
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
     finally:
         conn.close()
 
 
-def load_all() -> list[dict]:
-    conn = _connect()
-    try:
-        conn.row_factory = sqlite3.Row
-        rows = conn.execute("SELECT * FROM packages").fetchall()
-        return [dict(r) for r in rows]
-    finally:
-        conn.close()
+def search_candidates(
+    match_expr: str, columns: tuple[str, ...] | None = None, limit: int = 300
+) -> list[dict]:
+    """Packages matching an FTS5 expression, best first, each with a 'relevance' score.
+
+    With columns given, only hits inside those index columns match and score.
+    """
+    if columns:
+        match_expr = f"{{{' '.join(columns)}}} : ({match_expr})"
+    weights = ", ".join(str(w) for w in FTS_WEIGHTS)
+    with _open_snapshot(db_path()) as conn:
+        rows = conn.execute(
+            f"""
+            SELECT p.*, -bm25(packages_fts, {weights}) AS relevance
+            FROM packages_fts
+            JOIN packages p ON p.id = packages_fts.rowid
+            WHERE packages_fts MATCH ?
+            ORDER BY relevance DESC
+            LIMIT ?
+            """,
+            (match_expr, limit),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def matching_ids(match_expr: str) -> set[int]:
+    """Ids of every package matching an FTS5 expression."""
+    with _open_snapshot(db_path()) as conn:
+        rows = conn.execute(
+            "SELECT rowid FROM packages_fts WHERE packages_fts MATCH ?", (match_expr,)
+        ).fetchall()
+    return {r[0] for r in rows}
 
 
 def get_meta(key: str) -> str | None:
-    conn = _connect()
-    try:
+    with _open_snapshot(db_path()) as conn:
         row = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
-        return row[0] if row else None
-    finally:
-        conn.close()
+    return row[0] if row else None
+
+
+def snapshot_info() -> dict:
+    """Count, build time, age in days, schema version and path of the snapshot."""
+    with _open_snapshot(db_path()) as conn:
+        count = conn.execute("SELECT COUNT(*) FROM packages").fetchone()[0]
+        meta = dict(conn.execute("SELECT key, value FROM meta").fetchall())
+    refreshed_at = meta.get("refreshed_at", "")
+    age_days = (datetime.now(timezone.utc) - datetime.fromisoformat(refreshed_at)).days
+    return {
+        "count": count,
+        "refreshed_at": refreshed_at,
+        "age_days": age_days,
+        "schema_version": int(meta["schema_version"]),
+        "path": str(db_path()),
+    }

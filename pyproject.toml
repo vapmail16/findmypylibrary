@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "findmypylibrary"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Describe a use case in plain English, get a ranked shortlist of real PyPI packages — offline, no API key required."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -38,11 +38,15 @@ Homepage = "https://github.com/vapmail16/findmypylibrary"
 [project.scripts]
 findmypylibrary = "findmypylibrary.cli:main"
 
+[tool.hatch.version]
+path = "src/findmypylibrary/__init__.py"
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/findmypylibrary"]
 
 [tool.pytest.ini_options]
 addopts = "--cov=findmypylibrary --cov-report=term-missing"
+pythonpath = ["tests"]
 testpaths = ["tests"]
 asyncio_mode = "auto"
 

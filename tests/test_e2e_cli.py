@@ -6,6 +6,7 @@ calling Python functions directly.
 
 No network calls: the snapshot cache is pre-seeded before the subprocess runs.
 """
+
 from __future__ import annotations
 
 import os
@@ -14,29 +15,22 @@ import sys
 from pathlib import Path
 
 import pytest
+from helpers import make_pkg
 
 from findmypylibrary import cache
 
 
 @pytest.fixture()
-def seeded_cache_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict:
-    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+def seeded_cache_env(isolated_cache_dir: Path) -> dict:
     cache.save_packages(
         [
-            {
-                "name": "openpyxl",
-                "summary": "A Python library to read/write Excel 2010 xlsx/xlsm files",
-                "keywords": "",
-                "homepage": "",
-                "version": "3.1.0",
-                "last_release": "2026-01-01T00:00:00Z",
-                "download_count": 339_316_525,
-                "rank": 1,
-            }
+            make_pkg(
+                "openpyxl", "A Python library to read/write Excel 2010 xlsx/xlsm files", 339_316_525
+            )
         ]
     )
     env = dict(os.environ)
-    env["XDG_CACHE_HOME"] = str(tmp_path)
+    env["XDG_CACHE_HOME"] = str(isolated_cache_dir)
     return env
 
 

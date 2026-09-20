@@ -1,126 +1,194 @@
-"""Unit tests for the ranking engine.
+"""Ranking tests. Each asserts the ranking *outcome* a user would see (which
+package comes first / is excluded), never a proxy like "score changed"."""
 
-Written before the two-stage ranking fix (TDD): these assert the real
-ranking *outcome* users see (e.g. openpyxl beats numbers-parser for an
-"excel" query), not a proxy like "score changed" or "list is non-empty".
-"""
 from __future__ import annotations
 
-from findmypylibrary.rank import BM25, expand_query, search, tokenize
+from helpers import make_pkg
+
+from findmypylibrary import cache, rank
 
 
-def make_pkg(
-    name: str,
-    summary: str,
-    downloads: int,
-    last_release: str = "2026-01-01T00:00:00Z",
-    keywords: str = "",
-) -> dict:
-    return {
-        "name": name,
-        "summary": summary,
-        "keywords": keywords,
-        "download_count": downloads,
-        "last_release": last_release,
-    }
+def names(query: str, packages: list[dict], top_n: int = 10) -> list[str]:
+    cache.save_packages(packages)
+    return [pkg["name"] for pkg, _ in rank.search(query, top_n=top_n)]
 
 
 def test_tokenize_lowercases_and_splits_on_non_alnum() -> None:
-    assert tokenize("Read/Write Excel-2010 xlsx!") == ["read", "write", "excel", "2010", "xlsx"]
+    assert rank.tokenize("Read/Write Excel-2010 xlsx!") == [
+        "read",
+        "write",
+        "excel",
+        "2010",
+        "xlsx",
+    ]
 
 
-def test_tokenize_handles_none() -> None:
-    assert tokenize(None) == []
+def test_content_terms_drops_stopwords_and_duplicates() -> None:
+    assert rank.content_terms("a python library to parse the PDF and parse html") == [
+        "parse",
+        "pdf",
+        "html",
+    ]
+
+
+def test_content_terms_keeps_everything_when_query_is_only_stopwords() -> None:
+    assert rank.content_terms("to be or not to be") != []
+
+
+def test_empty_or_punctuation_only_query_returns_nothing() -> None:
+    assert names("?!", [make_pkg("foo", "does something")]) == []
 
 
 def test_no_match_returns_empty_list() -> None:
-    packages = [make_pkg("foo", "does something completely unrelated", 1000)]
-    assert search("zzznonexistentterm", packages) == []
+    assert names("zzznonexistentterm", [make_pkg("foo", "does something unrelated")]) == []
 
 
-def test_relevance_gate_prefers_popularity_among_qualified_matches() -> None:
-    """Regression test for the short-doc-bias bug: a short, keyword-dense
-    summary must not outrank a hugely more popular, genuinely relevant package."""
+def test_popular_relevant_package_beats_short_keyword_dense_niche_one() -> None:
+    """Regression: BM25 short-document bias let numbers-parser outrank openpyxl."""
+    result = names(
+        "read and write excel spreadsheets",
+        [
+            make_pkg(
+                "openpyxl", "A Python library to read/write Excel 2010 xlsx/xlsm files", 339_316_525
+            ),
+            make_pkg("numbers-parser", "Read and write Apple Numbers spreadsheets", 924_605),
+            make_pkg("tifffile", "Read and write TIFF files", 27_744_478),
+        ],
+    )
+    assert result[0] == "openpyxl"
+
+
+def test_weak_match_is_excluded_even_if_far_more_popular() -> None:
+    result = names(
+        "parse messy pdf",
+        [
+            make_pkg("mega-lib", "a pdf viewer for something else entirely", 500_000_000),
+            make_pkg(
+                "docling-parse", "Parse text with coordinates from messy pdf files", 3_581_578
+            ),
+        ],
+    )
+    assert result == ["docling-parse"]
+
+
+def test_stemming_finds_famous_packages_whose_summary_uses_another_word_form() -> None:
+    """Regression: 'resize images' missed Pillow ('Imaging'), 'plot' missed 'plotting'."""
     packages = [
-        make_pkg(
-            "openpyxl",
-            "A Python library to read/write Excel 2010 xlsx/xlsm files",
-            339_316_525,
-        ),
-        make_pkg("numbers-parser", "Read and write Apple Numbers spreadsheets", 924_605),
-        make_pkg("tifffile", "Read and write TIFF files", 27_744_478),
+        make_pkg("pillow", "Python Imaging Library (fork)", 535_067_156),
+        make_pkg("matplotlib", "Python plotting package", 227_869_222),
+        make_pkg("requests", "Python HTTP for Humans.", 1_695_910_251),
     ]
-    results = search("read and write excel spreadsheets", packages)
-    names = [pkg["name"] for pkg, _ in results]
-    assert names[0] == "openpyxl"
+    assert names("resize images", packages)[0] == "pillow"
+    assert names("plot charts", packages)[0] == "matplotlib"
 
 
-def test_low_relevance_candidate_excluded_even_if_far_more_popular() -> None:
-    packages = [
-        make_pkg("mega-lib", "a pdf viewer for something else entirely", 500_000_000),
-        make_pkg(
-            "docling-parse",
-            "Simple package to extract text with coordinates from programmatic pdf files",
-            3_581_578,
-        ),
-    ]
-    results = search("parse messy pdf", packages)
-    names = [pkg["name"] for pkg, _ in results]
-    assert names[0] == "docling-parse"
-    assert "mega-lib" not in names
+def test_description_text_finds_package_when_no_core_field_has_the_term() -> None:
+    """Regression: 'dataframes' could not find pandas because its summary never says it."""
+    result = names(
+        "dataframes",
+        [
+            make_pkg(
+                "pandas",
+                "Powerful data structures for data analysis, time series, and statistics",
+                739_713_944,
+                description="Size mutability: columns can be inserted into a DataFrame.",
+            ),
+            make_pkg("requests", "Python HTTP for Humans.", 1_695_910_251),
+        ],
+    )
+    assert result == ["pandas"]
 
 
-def test_name_match_is_weighted_above_summary_only_match() -> None:
-    packages = [
-        make_pkg("scheduler", "does something else entirely", 10_000),
-        make_pkg("otherlib", "a wrapper around scheduler for something else", 10_000),
-    ]
-    results = search("scheduler", packages)
-    assert results[0][0]["name"] == "scheduler"
+def test_readme_noise_does_not_beat_a_real_match() -> None:
+    """Regression: boto3's README mentions 'unit tests', which tied it with testing tools."""
+    result = names(
+        "unit testing",
+        [
+            make_pkg(
+                "boto3",
+                "The AWS SDK for Python",
+                3_206_668_324,
+                description="Running tests: you can run the unit tests with tox before a release.",
+            ),
+            make_pkg(
+                "testtools", "Extensions to the standard library unit testing framework", 900_000
+            ),
+        ],
+    )
+    assert result[0] == "testtools"
+    assert "boto3" not in result
 
 
-def test_synonym_expansion_matches_xlsx_for_excel_query() -> None:
-    packages = [make_pkg("xlsxwriter", "Write xlsx files fast", 10_000_000)]
-    results = search("excel", packages)
-    assert len(results) == 1
-    assert results[0][0]["name"] == "xlsxwriter"
+def test_synonym_connects_postgres_to_postgresql() -> None:
+    result = names(
+        "connect to postgres database",
+        [
+            make_pkg("psycopg2", "psycopg2 - Python-PostgreSQL Database Adapter", 63_666_344),
+            make_pkg("pymssql", "DB-API interface to Microsoft SQL Server database", 9_000_000),
+        ],
+    )
+    assert result[0] == "psycopg2"
+
+
+def test_partial_match_by_a_dominant_package_survives_the_gate() -> None:
+    """Regression: 'unit testing' dropped pytest because a niche package matched both words."""
+    result = names(
+        "unit testing",
+        [
+            make_pkg("pytest", "pytest: simple powerful testing with Python", 1_038_243_019),
+            make_pkg("kgb", "Utilities for spying on function calls in unit tests.", 150_000),
+        ],
+    )
+    assert result[0] == "pytest"
+
+
+def test_name_match_outranks_description_only_match() -> None:
+    result = names(
+        "scheduler",
+        [
+            make_pkg("scheduler", "does something else entirely", 10_000),
+            make_pkg("otherlib", "unrelated", 10_000, description="wraps a scheduler internally"),
+        ],
+    )
+    assert result[0] == "scheduler"
 
 
 def test_top_n_limits_results() -> None:
     packages = [make_pkg(f"pkg{i}", "parse pdf files", 1000 * (i + 1)) for i in range(20)]
-    results = search("parse pdf", packages, top_n=5)
-    assert len(results) == 5
+    assert len(names("parse pdf", packages, top_n=5)) == 5
 
 
-def test_more_recent_release_breaks_a_near_tie() -> None:
-    packages = [
-        make_pkg(
-            "old-lib", "parse pdf documents", 1_000_000, last_release="2015-01-01T00:00:00Z"
-        ),
-        make_pkg(
-            "new-lib", "parse pdf documents", 1_000_000, last_release="2026-09-01T00:00:00Z"
-        ),
-    ]
-    results = search("parse pdf documents", packages)
-    assert results[0][0]["name"] == "new-lib"
+def test_more_recent_release_breaks_a_tie() -> None:
+    result = names(
+        "parse pdf documents",
+        [
+            make_pkg(
+                "old-lib", "parse pdf documents", 1_000_000, last_release="2015-01-01T00:00:00Z"
+            ),
+            make_pkg(
+                "new-lib", "parse pdf documents", 1_000_000, last_release="2026-09-01T00:00:00Z"
+            ),
+        ],
+    )
+    assert result[0] == "new-lib"
 
 
-def test_missing_last_release_scores_as_least_recent() -> None:
-    known_date = "2020-01-01T00:00:00Z"
-    packages = [
-        make_pkg("known-date", "parse pdf documents", 1_000_000, last_release=known_date),
-        make_pkg("unknown-date", "parse pdf documents", 1_000_000, last_release=None),
-    ]
-    results = search("parse pdf documents", packages)
-    assert results[0][0]["name"] == "known-date"
+def test_missing_or_malformed_release_date_counts_as_least_recent() -> None:
+    result = names(
+        "parse pdf documents",
+        [
+            make_pkg("no-date", "parse pdf documents", 1_000_000, last_release=None),
+            make_pkg("bad-date", "parse pdf documents", 1_000_000, last_release="not-a-date"),
+            make_pkg(
+                "dated", "parse pdf documents", 1_000_000, last_release="2020-01-01T00:00:00Z"
+            ),
+        ],
+    )
+    assert result[0] == "dated"
 
 
-def test_bm25_scores_empty_for_unseen_term() -> None:
-    bm25 = BM25([["alpha", "beta"], ["gamma"]])
-    assert bm25.score(["zzz"]) == {}
-
-
-def test_expand_query_includes_synonyms_but_keeps_original_tokens() -> None:
-    expanded = expand_query(["excel"])
-    assert "excel" in expanded
-    assert "xlsx" in expanded
+def test_scores_are_between_zero_and_one_and_sorted() -> None:
+    cache.save_packages([make_pkg(f"pkg{i}", "parse pdf files", 10 ** (i + 2)) for i in range(5)])
+    scores = [score for _, score in rank.search("parse pdf")]
+    assert scores == sorted(scores, reverse=True)
+    assert all(0.0 <= s <= 1.0 for s in scores)

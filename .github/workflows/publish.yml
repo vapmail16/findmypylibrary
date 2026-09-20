@@ -1,0 +1,63 @@
+name: Publish to PyPI
+
+# Push a tag like v0.2.0 to release. Uses PyPI Trusted Publishing (OIDC), so no
+# API token is stored anywhere. One-time setup on pypi.org: project
+# findmypylibrary -> Settings -> Publishing -> add a GitHub publisher with
+# owner "vapmail16", repository "findmypylibrary", workflow "publish.yml",
+# environment "pypi".
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Run the full gate suite before releasing
+        run: |
+          pip install -e ".[dev]" build twine
+          pytest
+          ruff check src tests scripts
+          mypy src
+
+      - name: Tag must match the package version
+        run: |
+          VERSION="$(python -c 'import findmypylibrary; print(findmypylibrary.__version__)')"
+          if [ "v$VERSION" != "$GITHUB_REF_NAME" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match package version $VERSION" >&2
+            exit 1
+          fi
+
+      - name: Build and check distributions
+        run: |
+          python -m build
+          twine check dist/*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - uses: pypa/gh-action-pypi-publish@release/v1

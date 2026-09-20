@@ -1,22 +1,36 @@
 name: Monthly snapshot refresh
 
+# Builds the snapshot from live PyPI data and publishes it to the fixed
+# "snapshot-latest" release that `findmypylibrary refresh` downloads from.
+# Nothing is published unless the crawl and the ranking-quality gate both pass.
+#
+# Note: GitHub pauses scheduled workflows after 60 days without repository
+# activity. If that happens, re-enable it in the Actions tab or run it manually.
+
 on:
   schedule:
-    # 03:00 UTC on the 1st of every month
-    - cron: "0 3 1 * *"
+    - cron: "0 3 1 * *" # 03:00 UTC on the 1st of every month
   workflow_dispatch: {}
 
 permissions:
   contents: write
 
+concurrency:
+  group: snapshot-refresh
+  cancel-in-progress: false
+
 jobs:
   refresh:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
+    env:
+      XDG_CACHE_HOME: ${{ github.workspace }}/.cache
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TAG: snapshot-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
@@ -24,19 +38,22 @@ jobs:
         run: pip install -e .
 
       - name: Build snapshot from live PyPI data
-        env:
-          XDG_CACHE_HOME: ${{ github.workspace }}/.cache
+        # Exits non-zero (publishing nothing) if under 95% of packages could be fetched.
         run: findmypylibrary refresh --build-locally
 
-      - name: Publish snapshot as a GitHub Release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Ranking quality gate
+        # Exits non-zero if everyday queries stop returning well-known answers.
+        run: findmypylibrary golden
+
+      - name: Publish to the fixed snapshot release
         run: |
           set -euo pipefail
-          TAG="snapshot-$(date -u +%Y-%m)"
-          SNAPSHOT="${{ github.workspace }}/.cache/findmypylibrary/snapshot.sqlite"
-          gh release create "$TAG" \
-            "$SNAPSHOT#snapshot.sqlite" \
-            --title "Snapshot $TAG" \
-            --notes "Automated monthly PyPI snapshot (top-downloaded packages, summaries, release dates)." \
-            --latest
+          ASSET="$(python -c 'from findmypylibrary import fetch; print(fetch.snapshot_asset_name())')"
+          gzip -9 -c "$XDG_CACHE_HOME/findmypylibrary/snapshot.sqlite" > "$ASSET"
+          NOTES="Prebuilt PyPI snapshot downloaded by 'findmypylibrary refresh'. Rebuilt $(date -u +%Y-%m-%d). $(findmypylibrary status | head -1)"
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            gh release edit "$TAG" --notes "$NOTES" --latest=false
+          else
+            gh release create "$TAG" --title "Snapshot (rolling)" --notes "$NOTES" --latest=false
+          fi
+          gh release upload "$TAG" "$ASSET" --clobber

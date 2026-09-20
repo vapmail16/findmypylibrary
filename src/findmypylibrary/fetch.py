@@ -1,30 +1,89 @@
-"""Builds the local offline snapshot from public PyPI data (no API key needed)."""
+"""Gets snapshot data: either the prebuilt monthly snapshot (one download) or a
+live build from two public sources (no API key needed for either)."""
+
 from __future__ import annotations
 
 import asyncio
-import sqlite3
+import gzip
+import re
+import shutil
 from collections.abc import Callable
 from pathlib import Path
 
 import httpx
+
+from . import __version__, cache
 
 TOP_PACKAGES_URL = (
     "https://raw.githubusercontent.com/hugovk/top-pypi-packages/main/"
     "top-pypi-packages-30-days.min.json"
 )
 PYPI_JSON_URL = "https://pypi.org/pypi/{name}/json"
-GITHUB_RELEASE_SNAPSHOT_URL = "https://github.com/{repo}/releases/latest/download/snapshot.sqlite"
-DEFAULT_SNAPSHOT_REPO = "vapmail16/findmypylibrary"
-USER_AGENT = "findmypylibrary-refresh/0.1 (+https://pypi.org/project/findmypylibrary/)"
+
+# A fixed tag, not "releases/latest": publishing a code release on GitHub must
+# never change what this URL points at.
+SNAPSHOT_REPO = "vapmail16/findmypylibrary"
+SNAPSHOT_TAG = "snapshot-latest"
+
+USER_AGENT = f"findmypylibrary/{__version__} (+https://pypi.org/project/findmypylibrary/)"
 CONCURRENCY = 25
 REQUEST_TIMEOUT = 10.0
 MAX_RETRIES = 3
+RETRY_BASE_DELAY = 1.5
+DESCRIPTION_MAX_CHARS = 3000
+
+_MD_IMAGE_RE = re.compile(r"!\[[^\]]*\]\([^)]*\)")
+_MD_LINK_RE = re.compile(r"\[([^\]]*)\]\([^)]*\)")
+_URL_RE = re.compile(r"(?:https?://|www\.)\S+")
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+_RST_DIRECTIVE_RE = re.compile(r"^\s*\.\. .*::.*$", re.MULTILINE)
+
+
+class FetchError(Exception):
+    """A download needed for refresh failed; the message says what to do next."""
+
+
+def snapshot_asset_name() -> str:
+    return f"snapshot-v{cache.SCHEMA_VERSION}.sqlite.gz"
+
+
+def snapshot_url() -> str:
+    return (
+        f"https://github.com/{SNAPSHOT_REPO}/releases/download/"
+        f"{SNAPSHOT_TAG}/{snapshot_asset_name()}"
+    )
+
+
+def clean_description(text: str | None) -> str:
+    """README text reduced to searchable prose: no badges, links, URLs or markup."""
+    cleaned = _MD_IMAGE_RE.sub(" ", text or "")
+    cleaned = _MD_LINK_RE.sub(r"\1", cleaned)
+    cleaned = _URL_RE.sub(" ", cleaned)
+    cleaned = _HTML_TAG_RE.sub(" ", cleaned)
+    cleaned = _RST_DIRECTIVE_RE.sub(" ", cleaned)
+    cleaned = " ".join(cleaned.split())
+    return cleaned[:DESCRIPTION_MAX_CHARS].rstrip()
+
+
+def topic_classifiers(classifiers: list[str] | None) -> str:
+    """The subject-matter classifiers ("Topic ::", "Framework ::"), prefix removed."""
+    topics = []
+    for classifier in classifiers or []:
+        prefix, _, value = classifier.partition(" :: ")
+        if prefix in ("Topic", "Framework") and value:
+            topics.append(value)
+    return "; ".join(topics)
 
 
 def get_top_packages(limit: int = 15000) -> list[dict]:
-    """Fetch the top-downloaded package list (name + 30-day download count)."""
-    resp = httpx.get(TOP_PACKAGES_URL, timeout=30.0, headers={"User-Agent": USER_AGENT})
-    resp.raise_for_status()
+    """Source 1: the top-downloaded package list (name + 30-day download count)."""
+    try:
+        resp = httpx.get(TOP_PACKAGES_URL, timeout=30.0, headers={"User-Agent": USER_AGENT})
+        resp.raise_for_status()
+    except httpx.HTTPError as exc:
+        raise FetchError(
+            f"Could not download the top package list ({exc}). Check your connection and retry."
+        ) from exc
     rows = resp.json()["rows"]
     return rows[: min(limit, len(rows))]
 
@@ -32,37 +91,36 @@ def get_top_packages(limit: int = 15000) -> list[dict]:
 async def _fetch_one(
     client: httpx.AsyncClient, sem: asyncio.Semaphore, row: dict, rank: int
 ) -> dict | None:
+    """Source 2: one package's metadata from the PyPI JSON API."""
     name = row["project"]
     async with sem:
         for attempt in range(MAX_RETRIES):
             try:
                 resp = await client.get(PYPI_JSON_URL.format(name=name), timeout=REQUEST_TIMEOUT)
             except httpx.HTTPError:
-                await asyncio.sleep(1.5 * (attempt + 1))
+                await asyncio.sleep(RETRY_BASE_DELAY * (attempt + 1))
                 continue
 
             if resp.status_code == 404:
                 return None
-            if resp.status_code == 429:
-                await asyncio.sleep(2.0 * (attempt + 1))
-                continue
-            if resp.status_code >= 500:
-                await asyncio.sleep(1.5 * (attempt + 1))
+            if resp.status_code == 429 or resp.status_code >= 500:
+                await asyncio.sleep(RETRY_BASE_DELAY * (attempt + 1))
                 continue
 
             data = resp.json()
             info = data.get("info") or {}
             urls = data.get("urls") or []
-            last_release = urls[0].get("upload_time_iso_8601") if urls else None
             return {
                 "name": info.get("name") or name,
                 "summary": info.get("summary") or "",
                 "keywords": info.get("keywords") or "",
+                "topics": topic_classifiers(info.get("classifiers")),
+                "description": clean_description(info.get("description")),
                 "homepage": (info.get("project_urls") or {}).get("Homepage")
                 or info.get("home_page")
                 or "",
                 "version": info.get("version") or "",
-                "last_release": last_release,
+                "last_release": urls[0].get("upload_time_iso_8601") if urls else None,
                 "download_count": row.get("download_count") or 0,
                 "rank": rank,
             }
@@ -78,8 +136,7 @@ async def _run_refresh(
     async with httpx.AsyncClient(headers={"User-Agent": USER_AGENT}) as client:
         sem = asyncio.Semaphore(CONCURRENCY)
         tasks = [
-            asyncio.create_task(_fetch_one(client, sem, row, i + 1))
-            for i, row in enumerate(rows)
+            asyncio.create_task(_fetch_one(client, sem, row, i + 1)) for i, row in enumerate(rows)
         ]
         for coro in asyncio.as_completed(tasks):
             detail = await coro
@@ -88,6 +145,7 @@ async def _run_refresh(
                 on_progress(done, total)
             if detail:
                 results.append(detail)
+    results.sort(key=lambda pkg: pkg["rank"])
     return results
 
 
@@ -98,43 +156,42 @@ def run_refresh_sync(
     return asyncio.run(_run_refresh(rows, on_progress))
 
 
-def _is_valid_snapshot(path: Path) -> bool:
-    try:
-        conn = sqlite3.connect(path)
-        try:
-            conn.execute("SELECT COUNT(*) FROM packages").fetchone()
-        finally:
-            conn.close()
-        return True
-    except sqlite3.DatabaseError:
-        return False
+def download_prebuilt_snapshot(dest_path: Path) -> None:
+    """Download, decompress and validate the prebuilt snapshot, then swap it in.
 
-
-def download_prebuilt_snapshot(dest_path: Path, repo: str = DEFAULT_SNAPSHOT_REPO) -> bool:
-    """Download the monthly prebuilt snapshot published by GitHub Actions.
-
-    Returns True and writes to dest_path on success. Leaves dest_path
-    untouched and returns False if no release exists yet, the request
-    fails, or the downloaded file isn't a valid snapshot.
+    dest_path is only replaced once the download is proven valid, so a failed
+    or corrupt download never damages an existing good snapshot.
     """
-    url = GITHUB_RELEASE_SNAPSHOT_URL.format(repo=repo)
-    tmp_path = dest_path.with_suffix(".download")
+    hint = "Retry later, or run 'findmypylibrary refresh --build-locally' to crawl PyPI directly."
+    gz_path = dest_path.with_suffix(".download.gz")
+    db_tmp_path = dest_path.with_suffix(".download")
     try:
-        with httpx.stream(
-            "GET", url, follow_redirects=True, timeout=30.0, headers={"User-Agent": USER_AGENT}
-        ) as resp:
-            if resp.status_code != 200:
-                return False
-            with open(tmp_path, "wb") as f:
-                for chunk in resp.iter_bytes():
-                    f.write(chunk)
-    except httpx.HTTPError:
-        tmp_path.unlink(missing_ok=True)
-        return False
+        try:
+            with httpx.stream(
+                "GET",
+                snapshot_url(),
+                follow_redirects=True,
+                timeout=60.0,
+                headers={"User-Agent": USER_AGENT},
+            ) as resp:
+                if resp.status_code != 200:
+                    raise FetchError(
+                        f"No prebuilt snapshot available (HTTP {resp.status_code}). {hint}"
+                    )
+                with open(gz_path, "wb") as f:
+                    for chunk in resp.iter_bytes():
+                        f.write(chunk)
+        except httpx.HTTPError as exc:
+            raise FetchError(f"Could not download the prebuilt snapshot ({exc}). {hint}") from exc
 
-    if not _is_valid_snapshot(tmp_path):
-        tmp_path.unlink(missing_ok=True)
-        return False
+        try:
+            with gzip.open(gz_path, "rb") as src, open(db_tmp_path, "wb") as dst:
+                shutil.copyfileobj(src, dst)
+            cache.validate_snapshot(db_tmp_path)
+        except (OSError, EOFError, cache.SnapshotError) as exc:
+            raise FetchError(f"The downloaded snapshot is invalid ({exc}). {hint}") from exc
 
-    tmp_path.replace(dest_path)
-    return True
+        db_tmp_path.replace(dest_path)
+    finally:
+        gz_path.unlink(missing_ok=True)
+        db_tmp_path.unlink(missing_ok=True)

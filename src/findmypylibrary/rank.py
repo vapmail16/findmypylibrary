@@ -1,105 +1,102 @@
-"""Ranks cached packages against a free-text query.
+"""Ranks snapshot packages against a free-text query. Fully offline, no model.
 
-Two-stage design, not a flat weighted blend:
+Stage 1 — recall and gate. The query is reduced to content terms (stopwords
+dropped), each expanded with a few domain synonyms, and matched against the
+snapshot's stemmed full-text index. Name, summary, keywords and topics count in
+full; the README excerpt is heavily discounted because READMEs are noisy (boto3's
+says "unit tests"). A candidate survives only if it matches at least half of the
+query's terms and is not far below the best match.
 
-1. **Recall** — BM25 lexical match (query expanded with a small synonym list)
-   over each package's name (weighted higher than body text) and
-   summary/keywords. This is a *gate*: candidates scoring below
-   ``RELEVANCE_GATE_RATIO`` of the top relevance score are dropped.
-2. **Rank** — among the candidates that cleared the gate, rank primarily by
-   download popularity (with recency and leftover relevance as tiebreakers).
+The constants below were chosen on the real 15k snapshot with the golden-query
+set (golden.py): pass rate is flat across a wide band around them, so they are
+not knife-edge. Re-run `findmypylibrary golden` after changing any of them.
 
-A flat linear blend of relevance/popularity/maintenance has a known failure
-mode: BM25 favors short, keyword-dense summaries (e.g. a niche package whose
-whole summary is "Read and write Apple Numbers spreadsheets") over a longer,
-more informative match (openpyxl's actual Excel summary), and that relevance
-gap can swamp a 100x-larger popularity signal under min-max normalization.
-Splitting relevance into a gate, then ranking survivors by popularity, fixes
-that without adding a model or an external dependency.
+Stage 2 — rank. Survivors are ordered by a blend of relevance, download
+popularity and release recency. Popularity is what lets pandas or pytest beat
+an obscure package whose one-line summary happens to repeat the query.
 """
+
 from __future__ import annotations
 
 import math
 import re
-from collections import Counter, defaultdict
 from datetime import datetime, timezone
+
+from . import cache
 
 TOKEN_RE = re.compile(r"[a-z0-9]+")
 
-NAME_FIELD_BOOST = 3
-RELEVANCE_GATE_RATIO = 0.5
+CANDIDATE_LIMIT = 1000
+MIN_TERM_COVERAGE = 0.5
+RELEVANCE_GATE_RATIO = 0.25
+DESCRIPTION_WEIGHT = 0.3
 
-POPULARITY_WEIGHT = 0.6
-RELEVANCE_TIEBREAK_WEIGHT = 0.3
-MAINTENANCE_WEIGHT = 0.1
+RELEVANCE_WEIGHT = 0.45
+POPULARITY_WEIGHT = 0.45
+RECENCY_WEIGHT = 0.10
 
-# Small, curated set of domain synonyms so a query using one common term still
-# finds packages whose summary uses a close relative of it. Not exhaustive by
-# design — this is meant to fix common recall misses, not be a thesaurus.
-SYNONYMS: dict[str, list[str]] = {
-    "excel": ["excel", "xlsx", "xls", "spreadsheet", "spreadsheets"],
-    "spreadsheet": ["spreadsheet", "spreadsheets", "excel", "xlsx"],
-    "spreadsheets": ["spreadsheet", "spreadsheets", "excel", "xlsx"],
-    "pdf": ["pdf", "pdfs", "document", "documents"],
-    "pdfs": ["pdf", "pdfs", "document", "documents"],
-    "image": ["image", "images", "photo", "photos", "picture", "pictures"],
-    "images": ["image", "images", "photo", "photos", "picture", "pictures"],
-    "picture": ["picture", "pictures", "image", "images", "photo"],
-    "cron": ["cron", "schedule", "scheduler", "scheduling"],
-    "schedule": ["schedule", "scheduler", "scheduling", "cron"],
-    "database": ["database", "db", "sql"],
-    "db": ["database", "db", "sql"],
-    "async": ["async", "asyncio", "concurrent", "concurrency"],
-}
+STOPWORDS = frozenset(
+    """a an and are as at be by can do for from how i in into is it library lib me module my
+    need of on or package packages python some that the this to tool use using want way
+    with""".split()
+)
+
+# Small, curated domain synonyms for terms stemming cannot connect. Not a
+# thesaurus: only add pairs that fix a real, observed recall miss.
+_SYNONYM_SETS = [
+    ["excel", "xlsx", "xls", "spreadsheet"],
+    ["postgres", "postgresql", "psql"],
+    ["mongo", "mongodb"],
+    ["k8s", "kubernetes"],
+    ["js", "javascript"],
+    ["db", "database"],
+    ["image", "photo", "picture"],
+    ["chart", "plot", "graph", "visualization"],
+    ["scrape", "scraper", "crawl", "crawler", "spider"],
+    ["email", "mail", "smtp"],
+    ["cli", "commandline"],
+    ["auth", "authentication"],
+    ["config", "configuration", "settings"],
+    ["env", "environment", "dotenv"],
+    ["cron", "schedule", "scheduler"],
+    ["async", "asyncio", "asynchronous"],
+    ["jwt", "jws", "jose"],
+    ["encryption", "cryptography", "crypto"],
+]
 
 
 def tokenize(text: str | None) -> list[str]:
     return TOKEN_RE.findall((text or "").lower())
 
 
-def expand_query(tokens: list[str]) -> list[str]:
-    """Add synonym tokens for common domain terms found in the query."""
-    expanded = list(tokens)
-    for token in tokens:
-        expanded.extend(SYNONYMS.get(token, []))
-    return expanded
+def _stem(token: str) -> str:
+    """Cheap plural fold, used only to look synonyms up ("emails" -> "email")."""
+    for suffix, replacement in (("ies", "y"), ("ing", ""), ("s", "")):
+        if token.endswith(suffix) and len(token) - len(suffix) >= 3:
+            return token[: -len(suffix)] + replacement
+    return token
 
 
-class BM25:
-    def __init__(self, docs: list[list[str]]):
-        self.n = len(docs)
-        self.doc_lens = [len(d) for d in docs]
-        self.avgdl = (sum(self.doc_lens) / self.n) if self.n else 0.0
-        self.index: dict[str, dict[int, int]] = {}
-        for i, doc in enumerate(docs):
-            for term, freq in Counter(doc).items():
-                self.index.setdefault(term, {})[i] = freq
-        self.idf = {
-            term: math.log(1 + (self.n - len(postings) + 0.5) / (len(postings) + 0.5))
-            for term, postings in self.index.items()
-        }
-
-    def score(self, query_tokens: list[str], k1: float = 1.5, b: float = 0.75) -> dict[int, float]:
-        scores: dict[int, float] = defaultdict(float)
-        for term in set(query_tokens):
-            postings = self.index.get(term)
-            if not postings:
-                continue
-            idf = self.idf[term]
-            for doc_idx, freq in postings.items():
-                dl = self.doc_lens[doc_idx]
-                denom = freq + k1 * (1 - b + b * dl / self.avgdl)
-                scores[doc_idx] += idf * (freq * (k1 + 1)) / denom
-        return dict(scores)
+SYNONYMS: dict[str, list[str]] = {
+    term: [other for other in group if other != term] for group in _SYNONYM_SETS for term in group
+}
 
 
-def _minmax(values: list[float]) -> list[float]:
-    if not values:
-        return []
-    lo, hi = min(values), max(values)
-    if hi == lo:
-        return [1.0 for _ in values]
-    return [(v - lo) / (hi - lo) for v in values]
+def content_terms(query: str) -> list[str]:
+    """Distinct query tokens in order, minus stopwords (unless nothing else is left)."""
+    tokens = list(dict.fromkeys(tokenize(query)))
+    meaningful = [t for t in tokens if t not in STOPWORDS]
+    return meaningful or tokens
+
+
+def term_group(term: str) -> list[str]:
+    """A query term plus its synonyms; matching any of them counts as matching the term."""
+    synonyms = SYNONYMS.get(term) or SYNONYMS.get(_stem(term)) or []
+    return [term, *synonyms]
+
+
+def _match_expr(group: list[str]) -> str:
+    return " OR ".join(f'"{t}"' for t in group)
 
 
 def _recency_score(last_release: str | None) -> float:
@@ -109,52 +106,59 @@ def _recency_score(last_release: str | None) -> float:
         released = datetime.fromisoformat(last_release.replace("Z", "+00:00"))
     except ValueError:
         return 0.0
+    if released.tzinfo is None:
+        released = released.replace(tzinfo=timezone.utc)
     days_since = (datetime.now(timezone.utc) - released).days
     return 1.0 / (1.0 + max(days_since, 0) / 365.0)
 
 
-def _field_weighted_doc(package: dict) -> list[str]:
-    name_tokens = tokenize(package["name"]) * NAME_FIELD_BOOST
-    body_tokens = tokenize(package.get("summary")) + tokenize(package.get("keywords"))
-    return name_tokens + body_tokens
-
-
-def search(query: str, packages: list[dict], top_n: int = 10) -> list[tuple[dict, float]]:
-    """Rank cached packages for a free-text use-case description.
-
-    Stage 1 (recall + gate): BM25 relevance, query expanded with synonyms,
-    package name weighted above summary/keywords. Anything below
-    RELEVANCE_GATE_RATIO of the top relevance score is dropped as noise.
-
-    Stage 2 (rank): survivors are ordered by popularity, with recency and
-    leftover relevance as tiebreakers — so a hugely more-downloaded package
-    doesn't lose to a short, keyword-dense but far less popular one.
-    """
-    docs = [_field_weighted_doc(p) for p in packages]
-    bm25 = BM25(docs)
-    query_tokens = expand_query(tokenize(query))
-    raw_scores = bm25.score(query_tokens)
-    if not raw_scores:
+def search(query: str, top_n: int = 10) -> list[tuple[dict, float]]:
+    """Rank snapshot packages for a free-text use-case description."""
+    terms = content_terms(query)
+    if not terms:
         return []
 
-    top_relevance = max(raw_scores.values())
-    gate = top_relevance * RELEVANCE_GATE_RATIO
-    qualified = [(idx, score) for idx, score in raw_scores.items() if score >= gate]
+    group_exprs = [_match_expr(term_group(t)) for t in terms]
+    match_expr = " OR ".join(f"({g})" for g in group_exprs)
+    core = cache.search_candidates(match_expr, columns=cache.CORE_COLUMNS, limit=CANDIDATE_LIMIT)
+    described = cache.search_candidates(match_expr, columns=("description",), limit=CANDIDATE_LIMIT)
 
-    relevance_norm = _minmax([score for _, score in qualified])
-    popularity_norm = _minmax(
-        [math.log10((packages[idx]["download_count"] or 0) + 1) for idx, _ in qualified]
-    )
-    recency = [_recency_score(packages[idx].get("last_release")) for idx, _ in qualified]
+    # README text is noisy (boto3's mentions "unit tests"), so evidence found
+    # only in the description counts for much less than name/summary/keywords/topics.
+    candidates: dict[int, dict] = {}
+    for pkg in core:
+        candidates[pkg["id"]] = pkg
+    for pkg in described:
+        discounted = DESCRIPTION_WEIGHT * pkg["relevance"]
+        if pkg["id"] in candidates:
+            candidates[pkg["id"]]["relevance"] += discounted
+        else:
+            candidates[pkg["id"]] = {**pkg, "relevance": discounted}
+    if not candidates:
+        return []
 
-    blended = [
-        (
-            packages[idx],
-            POPULARITY_WEIGHT * pop + RELEVANCE_TIEBREAK_WEIGHT * rel + MAINTENANCE_WEIGHT * rec,
+    ids_per_term = [cache.matching_ids(g) for g in group_exprs]
+    top_relevance = max(pkg["relevance"] for pkg in candidates.values())
+    survivors = []
+    for pkg in candidates.values():
+        coverage = sum(pkg["id"] in ids for ids in ids_per_term) / len(ids_per_term)
+        relevant_enough = pkg["relevance"] >= top_relevance * RELEVANCE_GATE_RATIO
+        if coverage >= MIN_TERM_COVERAGE and relevant_enough:
+            survivors.append(pkg)
+
+    # Min-max over the survivors (not a ratio to the max): log-downloads only span
+    # ~5-9.5, so a ratio would barely separate a 1M-download package from a 1B one.
+    log_downloads = [math.log10((pkg["download_count"] or 0) + 1) for pkg in survivors]
+    lowest, highest = min(log_downloads), max(log_downloads)
+    scored = []
+    for pkg, log_dl in zip(survivors, log_downloads, strict=True):
+        popularity = (log_dl - lowest) / (highest - lowest) if highest > lowest else 1.0
+        score = (
+            RELEVANCE_WEIGHT * (pkg["relevance"] / top_relevance)
+            + POPULARITY_WEIGHT * popularity
+            + RECENCY_WEIGHT * _recency_score(pkg["last_release"])
         )
-        for (idx, _), rel, pop, rec in zip(
-            qualified, relevance_norm, popularity_norm, recency, strict=True
-        )
-    ]
-    blended.sort(key=lambda pair: pair[1], reverse=True)
-    return blended[:top_n]
+        scored.append((pkg, score))
+
+    scored.sort(key=lambda pair: pair[1], reverse=True)
+    return scored[:top_n]
