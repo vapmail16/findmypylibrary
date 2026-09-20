@@ -41,8 +41,12 @@ def seeded_cache_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict:
 
 
 def _installed_binary() -> str:
-    candidate = Path(sys.executable).parent / "findmypylibrary"
-    return str(candidate) if candidate.exists() else "findmypylibrary"
+    bin_dir = Path(sys.executable).parent
+    for name in ("findmypylibrary.exe", "findmypylibrary"):
+        candidate = bin_dir / name
+        if candidate.exists():
+            return str(candidate)
+    return "findmypylibrary"
 
 
 def test_installed_cli_help_runs() -> None:

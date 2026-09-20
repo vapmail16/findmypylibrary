@@ -11,15 +11,25 @@ pip install findmypylibrary
 ## Use
 
 ```bash
-findmypylibrary refresh              # one-time (few minutes): builds a local snapshot of the
-                                      # top 15,000 most-downloaded PyPI packages
+findmypylibrary refresh              # one-time (seconds): downloads this month's prebuilt snapshot
 findmypylibrary "parse messy pdfs"   # instant, offline, ranked results
 ```
 
-`refresh` pulls the current top-downloaded package list (from the public
-[top-pypi-packages](https://github.com/hugovk/top-pypi-packages) dataset) plus each
-package's summary and latest release date from the PyPI JSON API, and caches it locally
-in `~/.cache/findmypylibrary/snapshot.sqlite` (or `$XDG_CACHE_HOME/findmypylibrary/`).
+By default `refresh` downloads a snapshot of the top 15,000 most-downloaded PyPI packages
+that's rebuilt automatically once a month by
+[this repo's own GitHub Actions workflow](.github/workflows/monthly-refresh.yml) and published
+as a [GitHub Release](https://github.com/vapmail16/findmypylibrary/releases) — one HTTP request,
+a few seconds.
+
+That monthly build itself pulls from two public sources, no API key required: the
+top-downloaded package list (from
+[top-pypi-packages](https://github.com/hugovk/top-pypi-packages)) plus each package's summary
+and latest release date (from the PyPI JSON API). Run `findmypylibrary refresh --build-locally`
+to do that live crawl yourself instead of using the monthly build — slower (a few minutes,
+~15,000 requests to PyPI) but gets you a snapshot as of right now.
+
+Either way the result is cached locally in `~/.cache/findmypylibrary/snapshot.sqlite` (or
+`$XDG_CACHE_HOME/findmypylibrary/`).
 
 Every query after that runs fully offline against the cached snapshot. Ranking is two-stage,
 not a flat blend:
@@ -35,7 +45,8 @@ keyword-dense summaries over a longer, more informative match, and that gap can 
 100x-larger popularity signal. Gating on relevance first, then ranking by popularity, fixes it.)
 
 Re-run `findmypylibrary refresh` any time you want an up-to-date snapshot. Use
-`findmypylibrary refresh --limit 2000` for a much faster (but narrower) refresh.
+`findmypylibrary refresh --build-locally --limit 2000` for a much faster (but narrower) live
+crawl.
 
 ## License
 
