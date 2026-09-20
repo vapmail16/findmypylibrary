@@ -5,11 +5,13 @@ never be hit during the test suite.
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 import httpx
 import pytest
 import respx
 
-from findmypylibrary import fetch
+from findmypylibrary import cache, fetch
 
 
 def pypi_json(name: str, summary: str = "A package.") -> dict:
@@ -146,3 +148,76 @@ def test_run_refresh_sync_defaults_missing_text_fields_to_empty_string(field: st
     results = fetch.run_refresh_sync(rows)
 
     assert results[0][field] == ""
+
+
+def _build_valid_snapshot_bytes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> bytes:
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "source-cache"))
+    cache.save_packages(
+        [
+            {
+                "name": "boto3",
+                "summary": "AWS SDK",
+                "keywords": "",
+                "homepage": "",
+                "version": "1.0",
+                "last_release": "2026-01-01T00:00:00Z",
+                "download_count": 100,
+                "rank": 1,
+            }
+        ]
+    )
+    return cache.db_path().read_bytes()
+
+
+@respx.mock
+def test_download_prebuilt_snapshot_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    snapshot_bytes = _build_valid_snapshot_bytes(tmp_path, monkeypatch)
+    respx.get(
+        fetch.GITHUB_RELEASE_SNAPSHOT_URL.format(repo=fetch.DEFAULT_SNAPSHOT_REPO)
+    ).mock(return_value=httpx.Response(200, content=snapshot_bytes))
+
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "dest"))
+    dest = cache.db_path()
+
+    assert fetch.download_prebuilt_snapshot(dest) is True
+    assert dest.exists()
+    assert cache.load_all()[0]["name"] == "boto3"
+
+
+@respx.mock
+def test_download_prebuilt_snapshot_returns_false_when_no_release_yet(tmp_path: Path) -> None:
+    respx.get(
+        fetch.GITHUB_RELEASE_SNAPSHOT_URL.format(repo=fetch.DEFAULT_SNAPSHOT_REPO)
+    ).mock(return_value=httpx.Response(404))
+
+    dest = tmp_path / "snapshot.sqlite"
+
+    assert fetch.download_prebuilt_snapshot(dest) is False
+    assert not dest.exists()
+
+
+@respx.mock
+def test_download_prebuilt_snapshot_rejects_corrupt_download(tmp_path: Path) -> None:
+    respx.get(
+        fetch.GITHUB_RELEASE_SNAPSHOT_URL.format(repo=fetch.DEFAULT_SNAPSHOT_REPO)
+    ).mock(return_value=httpx.Response(200, content=b"not a real sqlite file"))
+
+    dest = tmp_path / "snapshot.sqlite"
+
+    assert fetch.download_prebuilt_snapshot(dest) is False
+    assert not dest.exists()
+    assert not dest.with_suffix(".download").exists()
+
+
+@respx.mock
+def test_download_prebuilt_snapshot_handles_network_error(tmp_path: Path) -> None:
+    respx.get(
+        fetch.GITHUB_RELEASE_SNAPSHOT_URL.format(repo=fetch.DEFAULT_SNAPSHOT_REPO)
+    ).mock(side_effect=httpx.ConnectError("boom"))
+
+    dest = tmp_path / "snapshot.sqlite"
+
+    assert fetch.download_prebuilt_snapshot(dest) is False
+    assert not dest.exists()

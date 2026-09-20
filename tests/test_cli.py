@@ -92,6 +92,7 @@ def test_num_option_limits_results() -> None:
 
 
 def test_refresh_builds_and_saves_snapshot(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cli.fetch, "download_prebuilt_snapshot", lambda dest_path: False)
     monkeypatch.setattr(
         cli.fetch,
         "get_top_packages",
@@ -117,5 +118,52 @@ def test_refresh_builds_and_saves_snapshot(monkeypatch: pytest.MonkeyPatch) -> N
     result = CliRunner().invoke(cli.main, ["refresh", "--limit", "1"])
 
     assert result.exit_code == 0
+    assert "No prebuilt snapshot" in result.output
     assert "Cached 1 packages" in result.output
     assert cache.exists() is True
+
+
+def test_refresh_uses_prebuilt_snapshot_when_available(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_download(dest_path: Path) -> bool:
+        seed_cache()
+        return True
+
+    monkeypatch.setattr(cli.fetch, "download_prebuilt_snapshot", fake_download)
+
+    result = CliRunner().invoke(cli.main, ["refresh"])
+
+    assert result.exit_code == 0
+    assert "Downloaded prebuilt snapshot" in result.output
+    assert cache.exists() is True
+
+
+def test_refresh_build_locally_skips_prebuilt_snapshot(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[str] = []
+    monkeypatch.setattr(
+        cli.fetch, "download_prebuilt_snapshot", lambda dest_path: calls.append("called")
+    )
+    monkeypatch.setattr(
+        cli.fetch, "get_top_packages", lambda limit: [{"project": "boto3", "download_count": 100}]
+    )
+    monkeypatch.setattr(
+        cli.fetch,
+        "run_refresh_sync",
+        lambda rows, on_progress=None: [
+            {
+                "name": "boto3",
+                "summary": "AWS SDK",
+                "keywords": "",
+                "homepage": "",
+                "version": "1.0",
+                "last_release": "2026-01-01T00:00:00Z",
+                "download_count": 100,
+                "rank": 1,
+            }
+        ],
+    )
+
+    result = CliRunner().invoke(cli.main, ["refresh", "--build-locally"])
+
+    assert result.exit_code == 0
+    assert calls == []
+    assert "Cached 1 packages" in result.output

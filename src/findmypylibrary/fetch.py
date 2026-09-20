@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 from collections.abc import Callable
+from pathlib import Path
 
 import httpx
 
@@ -11,6 +13,8 @@ TOP_PACKAGES_URL = (
     "top-pypi-packages-30-days.min.json"
 )
 PYPI_JSON_URL = "https://pypi.org/pypi/{name}/json"
+GITHUB_RELEASE_SNAPSHOT_URL = "https://github.com/{repo}/releases/latest/download/snapshot.sqlite"
+DEFAULT_SNAPSHOT_REPO = "vapmail16/findmypylibrary"
 USER_AGENT = "findmypylibrary-refresh/0.1 (+https://pypi.org/project/findmypylibrary/)"
 CONCURRENCY = 25
 REQUEST_TIMEOUT = 10.0
@@ -92,3 +96,45 @@ def run_refresh_sync(
 ) -> list[dict]:
     """Fetch per-package metadata for every row, with bounded concurrency."""
     return asyncio.run(_run_refresh(rows, on_progress))
+
+
+def _is_valid_snapshot(path: Path) -> bool:
+    try:
+        conn = sqlite3.connect(path)
+        try:
+            conn.execute("SELECT COUNT(*) FROM packages").fetchone()
+        finally:
+            conn.close()
+        return True
+    except sqlite3.DatabaseError:
+        return False
+
+
+def download_prebuilt_snapshot(dest_path: Path, repo: str = DEFAULT_SNAPSHOT_REPO) -> bool:
+    """Download the monthly prebuilt snapshot published by GitHub Actions.
+
+    Returns True and writes to dest_path on success. Leaves dest_path
+    untouched and returns False if no release exists yet, the request
+    fails, or the downloaded file isn't a valid snapshot.
+    """
+    url = GITHUB_RELEASE_SNAPSHOT_URL.format(repo=repo)
+    tmp_path = dest_path.with_suffix(".download")
+    try:
+        with httpx.stream(
+            "GET", url, follow_redirects=True, timeout=30.0, headers={"User-Agent": USER_AGENT}
+        ) as resp:
+            if resp.status_code != 200:
+                return False
+            with open(tmp_path, "wb") as f:
+                for chunk in resp.iter_bytes():
+                    f.write(chunk)
+    except httpx.HTTPError:
+        tmp_path.unlink(missing_ok=True)
+        return False
+
+    if not _is_valid_snapshot(tmp_path):
+        tmp_path.unlink(missing_ok=True)
+        return False
+
+    tmp_path.replace(dest_path)
+    return True

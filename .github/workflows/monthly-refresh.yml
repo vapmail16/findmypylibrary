@@ -1,0 +1,42 @@
+name: Monthly snapshot refresh
+
+on:
+  schedule:
+    # 03:00 UTC on the 1st of every month
+    - cron: "0 3 1 * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install findmypylibrary
+        run: pip install -e .
+
+      - name: Build snapshot from live PyPI data
+        env:
+          XDG_CACHE_HOME: ${{ github.workspace }}/.cache
+        run: findmypylibrary refresh --build-locally
+
+      - name: Publish snapshot as a GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="snapshot-$(date -u +%Y-%m)"
+          SNAPSHOT="${{ github.workspace }}/.cache/findmypylibrary/snapshot.sqlite"
+          gh release create "$TAG" \
+            "$SNAPSHOT#snapshot.sqlite" \
+            --title "Snapshot $TAG" \
+            --notes "Automated monthly PyPI snapshot (top-downloaded packages, summaries, release dates)." \
+            --latest

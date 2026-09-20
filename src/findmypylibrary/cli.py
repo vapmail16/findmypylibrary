@@ -30,10 +30,30 @@ def main() -> None:
     "--limit",
     default=15000,
     show_default=True,
-    help="How many top-downloaded packages to snapshot.",
+    help="How many top-downloaded packages to snapshot (ignored when a prebuilt snapshot is used).",
 )
-def refresh(limit: int) -> None:
-    """Build (or rebuild) the local offline snapshot from public PyPI data."""
+@click.option(
+    "--build-locally",
+    is_flag=True,
+    help="Skip the prebuilt monthly snapshot and crawl PyPI directly (slow, ~15,000 requests).",
+)
+def refresh(limit: int, build_locally: bool) -> None:
+    """Build (or rebuild) the local offline snapshot from public PyPI data.
+
+    By default this downloads the prebuilt snapshot published monthly by
+    GitHub Actions (fast, one request). Pass --build-locally to instead
+    crawl PyPI directly for a snapshot built right now.
+    """
+    if not build_locally:
+        click.echo("Checking for a prebuilt monthly snapshot...")
+        if fetch.download_prebuilt_snapshot(cache.db_path()):
+            count = cache.get_meta("count") or "unknown"
+            refreshed_at = cache.get_meta("refreshed_at") or "unknown"
+            click.echo(f"Downloaded prebuilt snapshot: {count} packages (built {refreshed_at}).")
+            click.echo(f"Snapshot saved to {cache.db_path()}")
+            return
+        click.echo("No prebuilt snapshot available yet — building locally instead.")
+
     click.echo(f"Fetching the top {limit} most-downloaded PyPI packages...")
     rows = fetch.get_top_packages(limit)
     click.echo(f"Fetching metadata for {len(rows)} packages (this can take a few minutes)...")
