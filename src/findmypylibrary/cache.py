@@ -55,7 +55,13 @@ REFRESH_HINT = "Run 'findmypylibrary refresh' to download a fresh one."
 def cache_dir() -> Path:
     base = os.environ.get("XDG_CACHE_HOME") or str(Path.home() / ".cache")
     d = Path(base) / "findmypylibrary"
-    d.mkdir(parents=True, exist_ok=True)
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise SnapshotError(
+            f"Cannot use the cache directory {d} ({exc}). Fix its permissions, or point "
+            "XDG_CACHE_HOME at a writable location."
+        ) from exc
     return d
 
 
@@ -74,7 +80,10 @@ def _open_snapshot(path: Path) -> Iterator[sqlite3.Connection]:
         raise SnapshotError(f"No local snapshot yet. {REFRESH_HINT}")
     # A plain connection made read-only by pragma. Opening with a "?mode=ro" URI
     # instead makes a concurrent refresh fail with SQLITE_IOERR_LOCK.
-    conn = sqlite3.connect(path)
+    try:
+        conn = sqlite3.connect(path)
+    except sqlite3.DatabaseError as exc:
+        raise SnapshotError(f"The local snapshot cannot be opened ({exc}). {REFRESH_HINT}") from exc
     try:
         conn.row_factory = sqlite3.Row
         try:
@@ -118,6 +127,15 @@ def _is_compatible(path: Path) -> bool:
 def save_packages(results: list[dict]) -> None:
     """Replace the snapshot (rows and full-text index) in one transaction."""
     path = db_path()
+    try:
+        _write_snapshot(path, results)
+    except (OSError, sqlite3.DatabaseError) as exc:
+        raise SnapshotError(
+            f"Could not write the snapshot to {path} ({exc}). Check permissions and disk space."
+        ) from exc
+
+
+def _write_snapshot(path: Path, results: list[dict]) -> None:
     if path.exists() and not _is_compatible(path):
         path.unlink()
 

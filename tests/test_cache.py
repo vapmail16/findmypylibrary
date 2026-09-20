@@ -195,3 +195,20 @@ def test_save_replaces_a_snapshot_that_is_damaged_beyond_the_header() -> None:
     cache.save_packages([make_pkg("boto3", "AWS SDK")])
 
     assert [c["name"] for c in cache.search_candidates('"aws"')] == ["boto3"]
+
+
+def test_snapshot_that_cannot_be_written_raises_snapshot_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    directory_in_the_way = cache.cache_dir() / "snapshot.sqlite"
+    directory_in_the_way.mkdir()
+
+    with pytest.raises(cache.SnapshotError, match="Could not write"):
+        cache.save_packages([make_pkg("boto3", "AWS SDK")])
+
+
+def test_snapshot_that_cannot_be_opened_raises_snapshot_error() -> None:
+    (cache.cache_dir() / "snapshot.sqlite").mkdir()
+
+    with pytest.raises(cache.SnapshotError, match="refresh"):
+        cache.snapshot_info()

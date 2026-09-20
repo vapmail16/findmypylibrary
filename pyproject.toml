@@ -47,7 +47,7 @@ Issues = "https://github.com/vapmail16/findmypylibrary/issues"
 Changelog = "https://github.com/vapmail16/findmypylibrary/blob/master/CHANGELOG.md"
 
 [project.scripts]
-findmypylibrary = "findmypylibrary.cli:main"
+findmypylibrary = "findmypylibrary.cli:run"
 
 [tool.hatch.version]
 path = "src/findmypylibrary/__init__.py"

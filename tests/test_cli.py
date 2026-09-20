@@ -287,14 +287,17 @@ def test_refresh_with_an_empty_package_list_keeps_the_snapshot(
     assert cache.snapshot_info()["count"] == 1
 
 
-def test_unwritable_cache_is_actionable(monkeypatch: pytest.MonkeyPatch) -> None:
-    def denied(dest_path: Path) -> None:
-        raise PermissionError(13, "Permission denied", str(dest_path))
+def test_unusable_cache_directory_is_actionable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    blocker = tmp_path / "not-a-directory"
+    blocker.write_text("a file where the cache directory should go")
+    monkeypatch.setenv("XDG_CACHE_HOME", str(blocker))
 
-    monkeypatch.setattr(fetch, "download_prebuilt_snapshot", denied)
-    code, output = run("refresh")
-    assert code != 0
-    assert "Permission denied" in output
+    for command in (["status"], ["search", "excel"], ["refresh"]):
+        code, output = run(*command)
+        assert code != 0
+        assert "cache directory" in output
 
 
 def test_refresh_tolerates_a_few_missing_packages(monkeypatch: pytest.MonkeyPatch) -> None:

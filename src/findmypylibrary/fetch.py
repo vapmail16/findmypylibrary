@@ -197,9 +197,15 @@ def download_prebuilt_snapshot(dest_path: Path) -> None:
                     raise FetchError(
                         f"No prebuilt snapshot available (HTTP {resp.status_code}). {hint}"
                     )
-                with open(gz_path, "wb") as f:
-                    for chunk in resp.iter_bytes():
-                        f.write(chunk)
+                try:
+                    with open(gz_path, "wb") as f:
+                        for chunk in resp.iter_bytes():
+                            f.write(chunk)
+                except OSError as exc:
+                    raise FetchError(
+                        f"Could not save the snapshot to {dest_path} ({exc}). "
+                        "Check permissions and disk space."
+                    ) from exc
         except httpx.HTTPError as exc:
             raise FetchError(f"Could not download the prebuilt snapshot ({exc}). {hint}") from exc
 
@@ -210,7 +216,10 @@ def download_prebuilt_snapshot(dest_path: Path) -> None:
         except (OSError, EOFError, zlib.error, cache.SnapshotError) as exc:
             raise FetchError(f"The downloaded snapshot is invalid ({exc}). {hint}") from exc
 
-        db_tmp_path.replace(dest_path)
+        try:
+            db_tmp_path.replace(dest_path)
+        except OSError as exc:
+            raise FetchError(f"Could not save the snapshot to {dest_path} ({exc}).") from exc
     finally:
         gz_path.unlink(missing_ok=True)
         db_tmp_path.unlink(missing_ok=True)

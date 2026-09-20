@@ -6,8 +6,11 @@ fetch.py (and with it httpx, ~140 ms of imports) is imported only inside
 
 from __future__ import annotations
 
+import errno
 import functools
 import json
+import os
+import sys
 from collections.abc import Callable
 from typing import Any
 
@@ -67,14 +70,6 @@ def _friendly_errors(command: Callable[..., None]) -> Callable[..., None]:
             command(*args, **kwargs)
         except (FetchError, SnapshotError) as exc:
             raise click.ClickException(str(exc)) from exc
-        except BrokenPipeError:
-            # Output piped to a reader that stopped early (`| head`); click exits quietly.
-            raise
-        except OSError as exc:
-            raise click.ClickException(
-                f"{exc}. Check permissions and free disk space for the cache directory "
-                "(~/.cache/findmypylibrary, or $XDG_CACHE_HOME/findmypylibrary)."
-            ) from exc
 
     return wrapper
 
@@ -216,5 +211,19 @@ def golden_check() -> None:
         )
 
 
+def run() -> None:
+    """Console entry point. If whoever reads our output goes away (`| head`, a closed
+    pager), exit quietly: that surfaces as EPIPE on POSIX and EINVAL on Windows, and
+    click only handles the former. File errors are converted where they happen
+    (cache.py, fetch.py), so an OSError reaching here is about our own stdout."""
+    try:
+        main()
+    except OSError as exc:
+        if exc.errno not in (errno.EPIPE, errno.EINVAL):
+            raise
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        sys.exit(1)
+
+
 if __name__ == "__main__":
-    main()
+    run()

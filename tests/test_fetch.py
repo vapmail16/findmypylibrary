@@ -6,6 +6,7 @@ No test in this file makes a real network call — PyPI and GitHub are never hit
 from __future__ import annotations
 
 import gzip
+from pathlib import Path
 
 import httpx
 import pytest
@@ -372,3 +373,14 @@ def test_download_prebuilt_snapshot_rejects_corrupt_download_and_keeps_old_cache
 
     assert [c["name"] for c in cache.search_candidates('"good"')] == ["existing"]
     assert list(cache.cache_dir().glob("*.download*")) == []
+
+
+@respx.mock
+def test_download_that_cannot_be_written_to_disk_raises_fetch_error(tmp_path: Path) -> None:
+    respx.get(fetch.snapshot_url()).mock(
+        return_value=httpx.Response(200, content=_gzipped_valid_snapshot())
+    )
+    unwritable = tmp_path / "missing-directory" / "snapshot.sqlite"
+
+    with pytest.raises(fetch.FetchError, match="Could not save"):
+        fetch.download_prebuilt_snapshot(unwritable)
