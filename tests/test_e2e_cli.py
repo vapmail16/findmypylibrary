@@ -75,3 +75,23 @@ def test_installed_cli_missing_snapshot_exits_nonzero(tmp_path: Path) -> None:
     )
     assert result.returncode != 0
     assert "findmypylibrary refresh" in result.stderr + result.stdout
+
+
+def test_output_piped_to_a_reader_that_stops_early_is_not_reported_as_a_disk_problem(
+    seeded_cache_env: dict,
+) -> None:
+    """Regression: `findmypylibrary ... | head -1` hit the OSError handler and printed
+    "Check permissions and free disk space"."""
+    proc = subprocess.Popen(
+        [_installed_binary(), "excel", "spreadsheets"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=seeded_cache_env,
+    )
+    assert proc.stdout is not None and proc.stderr is not None
+    proc.stdout.close()  # the reader goes away before the CLI has written anything
+    stderr = proc.stderr.read().decode()
+    proc.wait(timeout=20)
+
+    assert "Check permissions" not in stderr
+    assert "Traceback" not in stderr

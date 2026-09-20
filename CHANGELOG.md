@@ -27,6 +27,24 @@ First functional release (0.0.1 was a name placeholder).
 - `status` command, stale-snapshot warning (45 days), `--json` output, `findmypylibrary.search()`
   Python API.
 
+### Hardening after an independent audit
+- Fixed a crash (`ValueError`) when a multi-term query had candidates but none covered half its
+  terms, e.g. a query with two typos.
+- One unexpected upstream response (403, HTML body, non-object JSON, list-valued keywords) now
+  costs one package instead of aborting the whole crawl; redirects are followed; a changed
+  top-package-list format gives an actionable error.
+- `--limit` and `-n` must be at least 1 (`--limit 0` used to wipe the snapshot); an empty crawl
+  is never saved.
+- Damage beyond a snapshot's first page is detected (`PRAGMA quick_check`) before a download is
+  swapped in, and reported as an actionable error if it appears at query time.
+- Non-ASCII queries are tokenised correctly ("résumé" is one word and matches "resume").
+- `findmypylibrary status bar widget` and `-n 2 parse pdf` are searches, not usage errors.
+- Searching no longer imports the HTTP stack (~140 ms faster start-up).
+- CLI tests now fail on any uncaught exception (they previously could not detect a crash); the
+  golden fixture also contains popular competitors and a random corpus sample, not only
+  packages the ranker already favoured.
+- Publishing requires the tag to be on master and the matching snapshot asset to exist.
+
 ### Process
 - CI on Linux/macOS/Windows × Python 3.10–3.13: tests with a 90% coverage gate, ruff, mypy.
 - Monthly refresh workflow with crawl and ranking-quality gates before publishing.

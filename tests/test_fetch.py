@@ -10,7 +10,7 @@ import gzip
 import httpx
 import pytest
 import respx
-from helpers import make_pkg
+from helpers import bulky_packages, damage_middle_pages, make_pkg
 
 from findmypylibrary import cache, fetch
 
@@ -226,6 +226,69 @@ def test_run_refresh_sync_defaults_missing_text_fields_to_empty_string(field: st
     assert results[0][field] == ""
 
 
+@pytest.mark.parametrize(
+    "response",
+    [
+        httpx.Response(403, text="<html>forbidden</html>"),
+        httpx.Response(200, text="<html>not json</html>"),
+        httpx.Response(200, json=["not", "an", "object"]),
+    ],
+)
+@respx.mock
+def test_one_unexpected_response_skips_that_package_not_the_whole_crawl(
+    response: httpx.Response,
+) -> None:
+    """Regression: a single 403 / HTML body raised JSONDecodeError and killed a 15k crawl."""
+    respx.get(fetch.PYPI_JSON_URL.format(name="bad")).mock(return_value=response)
+    respx.get(fetch.PYPI_JSON_URL.format(name="good")).mock(
+        return_value=httpx.Response(200, json=pypi_json("good"))
+    )
+    rows = [{"project": "bad", "download_count": 1}, {"project": "good", "download_count": 1}]
+
+    assert [r["name"] for r in fetch.run_refresh_sync(rows)] == ["good"]
+
+
+@respx.mock
+def test_crawl_follows_redirects() -> None:
+    respx.get(fetch.PYPI_JSON_URL.format(name="Old_Name")).mock(
+        return_value=httpx.Response(
+            301, headers={"Location": fetch.PYPI_JSON_URL.format(name="old-name")}
+        )
+    )
+    respx.get(fetch.PYPI_JSON_URL.format(name="old-name")).mock(
+        return_value=httpx.Response(200, json=pypi_json("old-name"))
+    )
+
+    results = fetch.run_refresh_sync([{"project": "Old_Name", "download_count": 1}])
+
+    assert [r["name"] for r in results] == ["old-name"]
+
+
+@respx.mock
+def test_list_valued_keywords_are_stored_as_text() -> None:
+    data = pypi_json("kw")
+    data["info"]["keywords"] = ["alpha", "beta"]
+    respx.get(fetch.PYPI_JSON_URL.format(name="kw")).mock(
+        return_value=httpx.Response(200, json=data)
+    )
+
+    results = fetch.run_refresh_sync([{"project": "kw", "download_count": 1}])
+    cache.save_packages(results)
+
+    assert results[0]["keywords"] == "alpha, beta"
+
+
+@pytest.mark.parametrize(
+    "response",
+    [httpx.Response(200, text="<html>"), httpx.Response(200, json={"unexpected": "shape"})],
+)
+@respx.mock
+def test_get_top_packages_unexpected_body_raises_fetch_error(response: httpx.Response) -> None:
+    respx.get(fetch.TOP_PACKAGES_URL).mock(return_value=response)
+    with pytest.raises(fetch.FetchError, match="package list"):
+        fetch.get_top_packages()
+
+
 # --- prebuilt snapshot download --------------------------------------------
 
 
@@ -273,11 +336,34 @@ def test_download_prebuilt_snapshot_network_error_raises() -> None:
         fetch.download_prebuilt_snapshot(cache.db_path())
 
 
-@pytest.mark.parametrize("payload", [b"not gzip at all", gzip.compress(b"not a sqlite file")])
+def _gzip_with_corrupt_deflate_stream() -> bytes:
+    data = bytearray(gzip.compress(b"x" * 50_000))
+    data[20:40] = bytes(20)
+    return bytes(data)
+
+
+def _gzipped_snapshot_with_damaged_pages() -> bytes:
+    cache.save_packages(bulky_packages())
+    damaged = damage_middle_pages(cache.db_path().read_bytes())
+    cache.db_path().unlink()
+    return gzip.compress(damaged)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        pytest.param(b"not gzip at all", id="not-gzip"),
+        pytest.param(gzip.compress(b"not a sqlite file"), id="not-sqlite"),
+        pytest.param(_gzip_with_corrupt_deflate_stream(), id="corrupt-deflate-stream"),
+        pytest.param("damaged-pages", id="sqlite-damaged-beyond-header"),
+    ],
+)
 @respx.mock
 def test_download_prebuilt_snapshot_rejects_corrupt_download_and_keeps_old_cache(
-    payload: bytes,
+    payload: bytes | str,
 ) -> None:
+    if payload == "damaged-pages":
+        payload = _gzipped_snapshot_with_damaged_pages()
     cache.save_packages([make_pkg("existing", "the good old snapshot")])
     respx.get(fetch.snapshot_url()).mock(return_value=httpx.Response(200, content=payload))
 

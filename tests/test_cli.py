@@ -8,13 +8,15 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 from click.testing import CliRunner
-from helpers import make_pkg
+from helpers import bulky_packages, damage_middle_pages, make_pkg
 
-from findmypylibrary import cache, cli, fetch
+from findmypylibrary import cache, cli, fetch, golden
 
 OPENPYXL = make_pkg(
     "openpyxl", "A Python library to read/write Excel 2010 xlsx/xlsm files", 339_316_525
@@ -22,18 +24,22 @@ OPENPYXL = make_pkg(
 
 
 def run(*args: str) -> tuple[int, str]:
+    """Invoke the CLI. CliRunner hides uncaught exceptions from `output`, so an
+    assertion on the text alone can never catch a crash: fail here instead."""
     result = CliRunner().invoke(cli.main, list(args))
+    crashed = result.exception is not None and not isinstance(result.exception, SystemExit)
+    assert not crashed, f"CLI crashed with {result.exception!r}"
     return result.exit_code, result.output
 
 
 def fake_crawl(monkeypatch: pytest.MonkeyPatch, listed: int, fetched: int) -> None:
     monkeypatch.setattr(
-        cli.fetch,
+        fetch,
         "get_top_packages",
         lambda limit: [{"project": f"pkg{i}", "download_count": 1} for i in range(listed)],
     )
     monkeypatch.setattr(
-        cli.fetch,
+        fetch,
         "run_refresh_sync",
         lambda rows, on_progress=None: [make_pkg(f"pkg{i}", "parse pdf") for i in range(fetched)],
     )
@@ -96,6 +102,48 @@ def test_no_match_prints_friendly_message() -> None:
     assert "No packages matched" in output
 
 
+def test_multi_term_query_where_nothing_covers_half_the_terms_is_a_clean_no_match() -> None:
+    """Regression: candidates existed but none survived the gate -> min() of empty list."""
+    cache.save_packages([OPENPYXL, make_pkg("pdfthing", "parse pdf files")])
+    code, output = run("search", "pdf", "qwzx", "vbnmq")
+    assert code == 0
+    assert "No packages matched" in output
+
+
+def test_search_with_corruption_beyond_the_header_is_actionable() -> None:
+    """Regression: only header corruption was handled; a damaged page mid-file crashed."""
+    cache.save_packages(bulky_packages())
+    cache.db_path().write_bytes(damage_middle_pages(cache.db_path().read_bytes()))
+    assert cache.snapshot_info()["count"] == 400  # header still reads fine
+
+    code, output = run("search", "parse", "pdf")
+
+    assert code != 0
+    assert "findmypylibrary refresh" in output
+
+
+def test_query_starting_with_a_no_argument_command_word_is_a_search() -> None:
+    cache.save_packages([make_pkg("statusbar", "status bar widget for terminals")])
+    code, output = run("status", "bar", "widget")
+    assert code == 0
+    assert "statusbar" in output
+
+
+def test_options_may_come_before_a_bare_query() -> None:
+    cache.save_packages([make_pkg(f"pkg{i}", "parse pdf files", 1000 * (i + 1)) for i in range(5)])
+    code, output = run("-n", "2", "parse", "pdf")
+    assert code == 0
+    assert output.count("pypi.org/project/") == 2
+
+
+@pytest.mark.parametrize("bad", ["0", "-1"])
+def test_num_must_be_positive(bad: str) -> None:
+    cache.save_packages([OPENPYXL])
+    code, output = run("search", "excel", "-n", bad)
+    assert code != 0
+    assert "-n" in output or "num" in output.lower()
+
+
 def test_num_option_limits_results() -> None:
     cache.save_packages([make_pkg(f"pkg{i}", "parse pdf files", 1000 * (i + 1)) for i in range(5)])
     code, output = run("search", "parse", "pdf", "-n", "2")
@@ -151,9 +199,10 @@ def test_status_without_snapshot_is_actionable() -> None:
 
 def test_refresh_downloads_prebuilt_snapshot_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
     def fake_download(dest_path: Path) -> None:
+        assert dest_path == cache.db_path()
         cache.save_packages([OPENPYXL])
 
-    monkeypatch.setattr(cli.fetch, "download_prebuilt_snapshot", fake_download)
+    monkeypatch.setattr(fetch, "download_prebuilt_snapshot", fake_download)
 
     code, output = run("refresh")
 
@@ -170,8 +219,8 @@ def test_refresh_never_silently_falls_back_to_crawling_pypi(
     def must_not_crawl(limit: int) -> list[dict]:
         raise AssertionError("refresh crawled PyPI without --build-locally")
 
-    monkeypatch.setattr(cli.fetch, "download_prebuilt_snapshot", failing_download)
-    monkeypatch.setattr(cli.fetch, "get_top_packages", must_not_crawl)
+    monkeypatch.setattr(fetch, "download_prebuilt_snapshot", failing_download)
+    monkeypatch.setattr(fetch, "get_top_packages", must_not_crawl)
 
     code, output = run("refresh")
 
@@ -189,7 +238,7 @@ def test_refresh_build_locally_crawls_and_skips_the_download(
     def must_not_download(dest_path: Path) -> None:
         raise AssertionError("downloaded the prebuilt snapshot despite --build-locally")
 
-    monkeypatch.setattr(cli.fetch, "download_prebuilt_snapshot", must_not_download)
+    monkeypatch.setattr(fetch, "download_prebuilt_snapshot", must_not_download)
     fake_crawl(monkeypatch, listed=10, fetched=10)
 
     code, output = run("refresh", "--build-locally", "--limit", "10")
@@ -212,6 +261,42 @@ def test_refresh_refuses_to_replace_good_snapshot_with_a_mostly_failed_crawl(
     assert [c["name"] for c in cache.search_candidates('"excel"')] == ["openpyxl"]
 
 
+@pytest.mark.parametrize("bad", ["0", "-1"])
+def test_refresh_limit_must_be_positive_and_never_wipes_the_snapshot(
+    monkeypatch: pytest.MonkeyPatch, bad: str
+) -> None:
+    """Regression: --limit 0 passed the 95% guard (0 < 0.95*0 is false) and saved 0 packages."""
+    cache.save_packages([OPENPYXL])
+    fake_crawl(monkeypatch, listed=0, fetched=0)
+
+    code, _ = run("refresh", "--build-locally", "--limit", bad)
+
+    assert code != 0
+    assert cache.snapshot_info()["count"] == 1
+
+
+def test_refresh_with_an_empty_package_list_keeps_the_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cache.save_packages([OPENPYXL])
+    fake_crawl(monkeypatch, listed=0, fetched=0)
+
+    code, output = run("refresh", "--build-locally")
+
+    assert code != 0
+    assert cache.snapshot_info()["count"] == 1
+
+
+def test_unwritable_cache_is_actionable(monkeypatch: pytest.MonkeyPatch) -> None:
+    def denied(dest_path: Path) -> None:
+        raise PermissionError(13, "Permission denied", str(dest_path))
+
+    monkeypatch.setattr(fetch, "download_prebuilt_snapshot", denied)
+    code, output = run("refresh")
+    assert code != 0
+    assert "Permission denied" in output
+
+
 def test_refresh_tolerates_a_few_missing_packages(monkeypatch: pytest.MonkeyPatch) -> None:
     fake_crawl(monkeypatch, listed=100, fetched=99)
     code, output = run("refresh", "--build-locally")
@@ -225,7 +310,7 @@ def test_refresh_network_failure_is_actionable_not_a_traceback(
     def failing_list(limit: int) -> list[dict]:
         raise fetch.FetchError("Could not download the top package list. Check your connection.")
 
-    monkeypatch.setattr(cli.fetch, "get_top_packages", failing_list)
+    monkeypatch.setattr(fetch, "get_top_packages", failing_list)
 
     code, output = run("refresh", "--build-locally")
 
@@ -242,7 +327,7 @@ def test_golden_fails_with_nonzero_exit_when_quality_is_below_the_bar(
 ) -> None:
     cache.save_packages([OPENPYXL])
     report = {"passed": 1, "total": 10, "pass_rate": 0.1, "failures": [{"query": "q", "got": []}]}
-    monkeypatch.setattr(cli.golden, "evaluate", lambda: report)
+    monkeypatch.setattr(golden, "evaluate", lambda: report)
 
     code, output = run("golden")
 
@@ -253,9 +338,18 @@ def test_golden_fails_with_nonzero_exit_when_quality_is_below_the_bar(
 def test_golden_passes_when_quality_meets_the_bar(monkeypatch: pytest.MonkeyPatch) -> None:
     cache.save_packages([OPENPYXL])
     report = {"passed": 10, "total": 10, "pass_rate": 1.0, "failures": []}
-    monkeypatch.setattr(cli.golden, "evaluate", lambda: report)
+    monkeypatch.setattr(golden, "evaluate", lambda: report)
 
     code, output = run("golden")
 
     assert code == 0
     assert "10/10" in output
+
+
+# --- startup cost ------------------------------------------------------------
+
+
+def test_search_path_does_not_import_the_http_stack() -> None:
+    """httpx costs ~140 ms to import and only `refresh` needs it."""
+    code = "import sys, findmypylibrary.cli; sys.exit('httpx' in sys.modules)"
+    assert subprocess.run([sys.executable, "-c", code], timeout=30).returncode == 0

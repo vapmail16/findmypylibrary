@@ -39,6 +39,17 @@ def test_empty_or_punctuation_only_query_returns_nothing() -> None:
     assert names("?!", [make_pkg("foo", "does something")]) == []
 
 
+def test_candidates_that_all_fail_the_coverage_gate_give_an_empty_result() -> None:
+    """Regression: ValueError (min of empty list) when no candidate survived the gate."""
+    assert names("pdf qwzx vbnmq", [make_pkg("pdfthing", "parse pdf files")]) == []
+
+
+def test_non_ascii_words_are_kept_whole_and_match_their_unaccented_form() -> None:
+    """Regression: 'résumé' was split into 'r' + 'sum'."""
+    assert rank.tokenize("Résumé parser") == ["résumé", "parser"]
+    assert names("résumé parser", [make_pkg("resumelib", "A resume parser")]) == ["resumelib"]
+
+
 def test_no_match_returns_empty_list() -> None:
     assert names("zzznonexistentterm", [make_pkg("foo", "does something unrelated")]) == []
 

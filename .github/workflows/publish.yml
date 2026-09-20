@@ -16,8 +16,15 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Release tags must point at a commit on master
+        run: git merge-base --is-ancestor "$GITHUB_SHA" origin/master
 
       - uses: actions/setup-python@v6
         with:
@@ -35,6 +42,17 @@ jobs:
           VERSION="$(python -c 'import findmypylibrary; print(findmypylibrary.__version__)')"
           if [ "v$VERSION" != "$GITHUB_REF_NAME" ]; then
             echo "Tag $GITHUB_REF_NAME does not match package version $VERSION" >&2
+            exit 1
+          fi
+
+      - name: The snapshot this version downloads must already be published
+        # Otherwise `findmypylibrary refresh` would 404 for every new install until the next
+        # monthly run. After a SCHEMA_VERSION bump: merge to master, run the "Monthly
+        # snapshot refresh" workflow, then push the tag.
+        run: |
+          ASSET="$(python -c 'from findmypylibrary import fetch; print(fetch.snapshot_asset_name())')"
+          if ! gh release view snapshot-latest --json assets -q '.assets[].name' | grep -qx "$ASSET"; then
+            echo "Release 'snapshot-latest' has no $ASSET. Run the Monthly snapshot refresh workflow first." >&2
             exit 1
           fi
 

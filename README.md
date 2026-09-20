@@ -17,6 +17,9 @@ findmypylibrary "parse pdf files" -n 5 --json   # machine-readable output
 findmypylibrary status               # how many packages, how old is the snapshot
 ```
 
+A bare query is a search, so `findmypylibrary status bar widget` searches too. To search for
+exactly a command word, be explicit: `findmypylibrary search status`.
+
 From Python:
 
 ```python
@@ -29,7 +32,7 @@ for package, score in findmypylibrary.search("parse pdf files", top_n=5):
 ## Where the data comes from
 
 The snapshot covers the 15,000 most-downloaded PyPI packages. It is rebuilt on the 1st of every
-month by [this repo's GitHub Actions workflow](.github/workflows/monthly-refresh.yml) from two
+month by [this repo's GitHub Actions workflow](https://github.com/vapmail16/findmypylibrary/blob/master/.github/workflows/monthly-refresh.yml) from two
 public sources, no API key needed:
 
 1. the top-downloaded package list from
@@ -97,8 +100,12 @@ Bump `__version__` in `src/findmypylibrary/__init__.py`, update `CHANGELOG.md`, 
 git tag v0.2.0 && git push origin v0.2.0
 ```
 
-[The publish workflow](.github/workflows/publish.yml) runs the full gate suite, checks the tag
-matches the version, and uploads to PyPI via Trusted Publishing (no token stored anywhere).
+[The publish workflow](https://github.com/vapmail16/findmypylibrary/blob/master/.github/workflows/publish.yml) runs the full gate suite, checks that
+the tag is on master and matches the version, checks that the snapshot this version downloads
+is already published, and uploads to PyPI via Trusted Publishing (no token stored anywhere).
+
+After a `SCHEMA_VERSION` bump: merge to master, run the "Monthly snapshot refresh" workflow
+(Actions tab, or `gh workflow run monthly-refresh.yml`), and only then push the tag.
 
 ## License
 

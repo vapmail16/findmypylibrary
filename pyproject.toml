@@ -12,7 +12,15 @@ license = "MIT"
 authors = [{ name = "Vikkas Pareek" }]
 keywords = ["pypi", "package-discovery", "cli", "developer-tools"]
 classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Typing :: Typed",
     "License :: OSI Approved :: MIT License",
     "Environment :: Console",
     "Topic :: Software Development :: Libraries",
@@ -34,12 +42,19 @@ dev = [
 
 [project.urls]
 Homepage = "https://github.com/vapmail16/findmypylibrary"
+Source = "https://github.com/vapmail16/findmypylibrary"
+Issues = "https://github.com/vapmail16/findmypylibrary/issues"
+Changelog = "https://github.com/vapmail16/findmypylibrary/blob/master/CHANGELOG.md"
 
 [project.scripts]
 findmypylibrary = "findmypylibrary.cli:main"
 
 [tool.hatch.version]
 path = "src/findmypylibrary/__init__.py"
+
+[tool.hatch.build.targets.sdist]
+# Source, docs and licence only: the 1.4 MB test corpus and CI config stay in git.
+include = ["src", "README.md", "CHANGELOG.md", "LICENSE", "pyproject.toml"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/findmypylibrary"]

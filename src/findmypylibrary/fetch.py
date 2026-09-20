@@ -7,12 +7,14 @@ import asyncio
 import gzip
 import re
 import shutil
+import zlib
 from collections.abc import Callable
 from pathlib import Path
 
 import httpx
 
 from . import __version__, cache
+from .errors import FetchError
 
 TOP_PACKAGES_URL = (
     "https://raw.githubusercontent.com/hugovk/top-pypi-packages/main/"
@@ -37,10 +39,6 @@ _MD_LINK_RE = re.compile(r"\[([^\]]*)\]\([^)]*\)")
 _URL_RE = re.compile(r"(?:https?://|www\.)\S+")
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
 _RST_DIRECTIVE_RE = re.compile(r"^\s*\.\. .*::.*$", re.MULTILINE)
-
-
-class FetchError(Exception):
-    """A download needed for refresh failed; the message says what to do next."""
 
 
 def snapshot_asset_name() -> str:
@@ -84,8 +82,20 @@ def get_top_packages(limit: int = 15000) -> list[dict]:
         raise FetchError(
             f"Could not download the top package list ({exc}). Check your connection and retry."
         ) from exc
-    rows = resp.json()["rows"]
-    return rows[: min(limit, len(rows))]
+    try:
+        rows = resp.json()["rows"]
+        return list(rows[: min(limit, len(rows))])
+    except (ValueError, KeyError, TypeError) as exc:
+        raise FetchError(
+            "The top package list came back in an unexpected format. Retry later; if it "
+            "persists, the upstream dataset changed and findmypylibrary needs an update."
+        ) from exc
+
+
+def _as_text(value: object) -> str:
+    if isinstance(value, (list, tuple)):
+        return ", ".join(str(v) for v in value)
+    return "" if value is None else str(value)
 
 
 async def _fetch_one(
@@ -101,19 +111,26 @@ async def _fetch_one(
                 await asyncio.sleep(RETRY_BASE_DELAY * (attempt + 1))
                 continue
 
-            if resp.status_code == 404:
-                return None
             if resp.status_code == 429 or resp.status_code >= 500:
                 await asyncio.sleep(RETRY_BASE_DELAY * (attempt + 1))
                 continue
+            if resp.status_code != 200:
+                return None
 
-            data = resp.json()
+            # One odd response (HTML error page, non-object JSON) must cost one
+            # package, never the whole crawl.
+            try:
+                data = resp.json()
+            except ValueError:
+                return None
+            if not isinstance(data, dict):
+                return None
             info = data.get("info") or {}
             urls = data.get("urls") or []
             return {
                 "name": info.get("name") or name,
-                "summary": info.get("summary") or "",
-                "keywords": info.get("keywords") or "",
+                "summary": _as_text(info.get("summary")),
+                "keywords": _as_text(info.get("keywords")),
                 "topics": topic_classifiers(info.get("classifiers")),
                 "description": clean_description(info.get("description")),
                 "homepage": (info.get("project_urls") or {}).get("Homepage")
@@ -133,7 +150,9 @@ async def _run_refresh(
     total = len(rows)
     done = 0
     results: list[dict] = []
-    async with httpx.AsyncClient(headers={"User-Agent": USER_AGENT}) as client:
+    async with httpx.AsyncClient(
+        headers={"User-Agent": USER_AGENT}, follow_redirects=True
+    ) as client:
         sem = asyncio.Semaphore(CONCURRENCY)
         tasks = [
             asyncio.create_task(_fetch_one(client, sem, row, i + 1)) for i, row in enumerate(rows)
@@ -188,7 +207,7 @@ def download_prebuilt_snapshot(dest_path: Path) -> None:
             with gzip.open(gz_path, "rb") as src, open(db_tmp_path, "wb") as dst:
                 shutil.copyfileobj(src, dst)
             cache.validate_snapshot(db_tmp_path)
-        except (OSError, EOFError, cache.SnapshotError) as exc:
+        except (OSError, EOFError, zlib.error, cache.SnapshotError) as exc:
             raise FetchError(f"The downloaded snapshot is invalid ({exc}). {hint}") from exc
 
         db_tmp_path.replace(dest_path)

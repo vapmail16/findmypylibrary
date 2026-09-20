@@ -24,3 +24,16 @@ def make_pkg(
         "download_count": downloads,
         "rank": 1,
     }
+
+
+def bulky_packages() -> list[dict]:
+    """Enough rows that the snapshot spans many sqlite pages."""
+    return [make_pkg(f"pkg{i}", f"parse pdf files number {i} " * 20) for i in range(400)]
+
+
+def damage_middle_pages(snapshot: bytes) -> bytes:
+    """Overwrite 30-60% of the file's pages: the header and meta table stay readable,
+    so the damage only shows once a query reads the index."""
+    pages = len(snapshot) // 4096
+    start, end = int(pages * 0.3) * 4096, int(pages * 0.6) * 4096
+    return snapshot[:start] + b"\xff" * (end - start) + snapshot[end:]

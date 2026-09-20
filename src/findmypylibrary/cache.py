@@ -15,6 +15,8 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
+from .errors import SnapshotError
+
 # Bump whenever the tables below change shape. The prebuilt snapshot's file
 # name carries this number, so an old client never downloads a newer layout.
 SCHEMA_VERSION = 2
@@ -48,10 +50,6 @@ CREATE VIRTUAL TABLE IF NOT EXISTS packages_fts USING fts5(
 """
 
 REFRESH_HINT = "Run 'findmypylibrary refresh' to download a fresh one."
-
-
-class SnapshotError(Exception):
-    """The local snapshot is missing, corrupt, empty or from another schema version."""
 
 
 def cache_dir() -> Path:
@@ -88,7 +86,11 @@ def _open_snapshot(path: Path) -> Iterator[sqlite3.Connection]:
             raise SnapshotError(
                 f"The local snapshot was built for a different version. {REFRESH_HINT}"
             )
-        yield conn
+        try:
+            yield conn
+        except sqlite3.DatabaseError as exc:
+            # Damage beyond the first page only shows up once a query reads it.
+            raise SnapshotError(f"The local snapshot is damaged. {REFRESH_HINT}") from exc
     finally:
         conn.close()
 
@@ -96,15 +98,19 @@ def _open_snapshot(path: Path) -> Iterator[sqlite3.Connection]:
 def validate_snapshot(path: Path) -> None:
     """Raise SnapshotError unless path is a non-empty snapshot this version can read."""
     with _open_snapshot(path) as conn:
+        # quick_check walks every page, including the full-text index tables.
+        if conn.execute("PRAGMA quick_check").fetchone()[0] != "ok":
+            raise SnapshotError(f"The snapshot is damaged. {REFRESH_HINT}")
         count = conn.execute("SELECT COUNT(*) FROM packages").fetchone()[0]
+        conn.execute("SELECT rowid FROM packages_fts WHERE packages_fts MATCH '\"python\"'")
     if count == 0:
         raise SnapshotError(f"The snapshot is empty. {REFRESH_HINT}")
 
 
 def _is_compatible(path: Path) -> bool:
     try:
-        with _open_snapshot(path):
-            return True
+        with _open_snapshot(path) as conn:
+            return bool(conn.execute("PRAGMA quick_check").fetchone()[0] == "ok")
     except SnapshotError:
         return False
 
@@ -204,7 +210,10 @@ def snapshot_info() -> dict:
         count = conn.execute("SELECT COUNT(*) FROM packages").fetchone()[0]
         meta = dict(conn.execute("SELECT key, value FROM meta").fetchall())
     refreshed_at = meta.get("refreshed_at", "")
-    age_days = (datetime.now(timezone.utc) - datetime.fromisoformat(refreshed_at)).days
+    try:
+        age_days = (datetime.now(timezone.utc) - datetime.fromisoformat(refreshed_at)).days
+    except (ValueError, TypeError) as exc:
+        raise SnapshotError(f"The local snapshot has no valid build date. {REFRESH_HINT}") from exc
     return {
         "count": count,
         "refreshed_at": refreshed_at,

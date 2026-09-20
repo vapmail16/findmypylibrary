@@ -6,7 +6,7 @@ import sqlite3
 from pathlib import Path
 
 import pytest
-from helpers import make_pkg
+from helpers import bulky_packages, damage_middle_pages, make_pkg
 
 from findmypylibrary import cache
 
@@ -165,3 +165,33 @@ def test_validate_snapshot_rejects_empty_snapshot(tmp_path: Path) -> None:
     cache.save_packages([])
     with pytest.raises(cache.SnapshotError, match="empty"):
         cache.validate_snapshot(cache.db_path())
+
+
+def test_snapshot_without_a_build_date_raises_snapshot_error() -> None:
+    cache.save_packages([make_pkg("boto3", "AWS SDK")])
+    conn = sqlite3.connect(cache.db_path())
+    conn.execute("DELETE FROM meta WHERE key = 'refreshed_at'")
+    conn.commit()
+    conn.close()
+
+    with pytest.raises(cache.SnapshotError, match="refresh"):
+        cache.snapshot_info()
+
+
+def test_damage_beyond_the_header_raises_snapshot_error_on_query_and_on_validation() -> None:
+    cache.save_packages(bulky_packages())
+    cache.db_path().write_bytes(damage_middle_pages(cache.db_path().read_bytes()))
+
+    with pytest.raises(cache.SnapshotError, match="damaged"):
+        cache.search_candidates('"pdf"')
+    with pytest.raises(cache.SnapshotError, match="damaged"):
+        cache.validate_snapshot(cache.db_path())
+
+
+def test_save_replaces_a_snapshot_that_is_damaged_beyond_the_header() -> None:
+    cache.save_packages(bulky_packages())
+    cache.db_path().write_bytes(damage_middle_pages(cache.db_path().read_bytes()))
+
+    cache.save_packages([make_pkg("boto3", "AWS SDK")])
+
+    assert [c["name"] for c in cache.search_candidates('"aws"')] == ["boto3"]

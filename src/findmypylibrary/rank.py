@@ -24,7 +24,8 @@ from datetime import datetime, timezone
 
 from . import cache
 
-TOKEN_RE = re.compile(r"[a-z0-9]+")
+# Unicode letters/digits, so "résumé" stays one word (the index folds accents itself).
+TOKEN_RE = re.compile(r"[^\W_]+")
 
 CANDIDATE_LIMIT = 1000
 MIN_TERM_COVERAGE = 0.5
@@ -145,6 +146,8 @@ def search(query: str, top_n: int = 10) -> list[tuple[dict, float]]:
         relevant_enough = pkg["relevance"] >= top_relevance * RELEVANCE_GATE_RATIO
         if coverage >= MIN_TERM_COVERAGE and relevant_enough:
             survivors.append(pkg)
+    if not survivors:
+        return []
 
     # Min-max over the survivors (not a ratio to the max): log-downloads only span
     # ~5-9.5, so a ratio would barely separate a 1M-download package from a 1B one.
