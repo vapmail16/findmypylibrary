@@ -11,7 +11,7 @@ First functional release (0.0.1 was a name placeholder).
   keywords. README-only evidence is heavily discounted (boto3's README mentions "unit tests").
 - Stopword removal, a curated synonym list, a term-coverage gate, and a relevance /
   popularity / recency blend tuned on real data.
-- Golden-query suite: 40 everyday queries with well-known answers. 39/40 pass on the full
+- Golden-query suite: 40 everyday queries with well-known answers. 40/40 pass on the full
   snapshot. Runs offline in tests and as a publish gate in the monthly workflow.
 
 ### Robustness

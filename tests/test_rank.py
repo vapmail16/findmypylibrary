@@ -101,6 +101,9 @@ def test_description_text_finds_package_when_no_core_field_has_the_term() -> Non
 
 def test_readme_noise_does_not_beat_a_real_match() -> None:
     """Regression: boto3's README mentions 'unit tests', which tied it with testing tools."""
+    unrelated = [
+        make_pkg(f"filler{i}", f"library number {i} for something else") for i in range(30)
+    ]
     result = names(
         "unit testing",
         [
@@ -108,11 +111,12 @@ def test_readme_noise_does_not_beat_a_real_match() -> None:
                 "boto3",
                 "The AWS SDK for Python",
                 3_206_668_324,
-                description="Running tests: you can run the unit tests with tox before a release.",
+                description="Boto3 is the AWS SDK. Running tests: run the unit tests with tox.",
             ),
             make_pkg(
                 "testtools", "Extensions to the standard library unit testing framework", 900_000
             ),
+            *unrelated,
         ],
     )
     assert result[0] == "testtools"

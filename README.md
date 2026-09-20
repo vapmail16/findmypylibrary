@@ -58,15 +58,23 @@ Fully offline and lexical — no model, no embeddings.
 2. **Rank.** Survivors are ordered by a blend of relevance, 30-day downloads and how recently
    the package was released.
 
-Known limits: matching is lexical, so a package is only found if its own metadata or README
-intro uses your words (or a stem/synonym of them). Results for very short queries lean towards
-popular packages.
+Known limits, measured on the real snapshot (40/40 golden queries pass; these are the edges):
+
+- Matching is lexical. A package is found only if its own metadata or README intro uses your
+  words, a stem of them, or a listed synonym. pandas never says "dataframe" in its metadata, so
+  "dataframes" returns polars and narwhals, while "data analysis" returns pandas first.
+- README-only matches are discounted on purpose. Raising them enough to surface pandas for
+  "dataframes" also surfaces boto3 for "unit testing" (its README says "run the unit tests");
+  the two are indistinguishable lexically, so precision wins.
+- Very common query words ("data", "web", "file") let a few popular but loosely related
+  packages into the lower half of the results.
 
 ## Development
 
 ```bash
 pip install -e ".[dev]"
-pytest                      # tests + coverage gate (>= 90%)
+pytest --cov-fail-under=90  # full suite with the coverage gate (CI runs this)
+pytest tests/test_rank.py   # a single file runs without tripping the gate
 ruff check src tests scripts && ruff format --check src tests scripts
 mypy src
 findmypylibrary golden      # ranking quality check against your local snapshot

@@ -26,7 +26,7 @@ jobs:
       - name: Run the full gate suite before releasing
         run: |
           pip install -e ".[dev]" build twine
-          pytest
+          pytest --cov-fail-under=90
           ruff check src tests scripts
           mypy src
 

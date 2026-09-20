@@ -58,6 +58,12 @@ def test_famous_package_is_in_the_top_five(real_corpus: None, query: str, expect
     assert expected in top5(query)
 
 
+def test_pandas_is_found_by_words_its_own_metadata_uses(real_corpus: None) -> None:
+    """pandas never says "dataframe" in its metadata, so that query finds polars instead
+    (a documented lexical limit); queries in pandas' own words must put it first."""
+    assert top5("data analysis")[0] == "pandas"
+
+
 def test_postgres_query_returns_postgres_drivers_not_mssql(real_corpus: None) -> None:
     results = top5("connect to postgres database")
     assert {"psycopg2", "psycopg2-binary", "psycopg", "asyncpg"} & set(results)
