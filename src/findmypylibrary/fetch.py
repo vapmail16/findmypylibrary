@@ -6,7 +6,6 @@ from __future__ import annotations
 import asyncio
 import gzip
 import re
-import shutil
 import zlib
 from collections.abc import Callable
 from pathlib import Path
@@ -33,12 +32,16 @@ REQUEST_TIMEOUT = 10.0
 MAX_RETRIES = 3
 RETRY_BASE_DELAY = 1.5
 DESCRIPTION_MAX_CHARS = 3000
+# The real snapshot is ~11 MB gzipped / ~20 MB raw; anything far beyond is not ours.
+MAX_DOWNLOAD_BYTES = 200 * 1024 * 1024
+MAX_SNAPSHOT_BYTES = 1024 * 1024 * 1024
 
 _MD_IMAGE_RE = re.compile(r"!\[[^\]]*\]\([^)]*\)")
 _MD_LINK_RE = re.compile(r"\[([^\]]*)\]\([^)]*\)")
 _URL_RE = re.compile(r"(?:https?://|www\.)\S+")
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
 _RST_DIRECTIVE_RE = re.compile(r"^\s*\.\. .*::.*$", re.MULTILINE)
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
 
 
 def snapshot_asset_name() -> str:
@@ -59,8 +62,16 @@ def clean_description(text: str | None) -> str:
     cleaned = _URL_RE.sub(" ", cleaned)
     cleaned = _HTML_TAG_RE.sub(" ", cleaned)
     cleaned = _RST_DIRECTIVE_RE.sub(" ", cleaned)
-    cleaned = " ".join(cleaned.split())
-    return cleaned[:DESCRIPTION_MAX_CHARS].rstrip()
+    return clean_text(cleaned)[:DESCRIPTION_MAX_CHARS].rstrip()
+
+
+def clean_text(value: object) -> str:
+    """Upstream text as one printable line: results are shown in a terminal, so no
+    control characters (escape sequences) may survive."""
+    if isinstance(value, (list, tuple)):
+        value = ", ".join(str(v) for v in value)
+    text = "" if value is None else str(value)
+    return " ".join(_CONTROL_CHARS_RE.sub("", text).split())
 
 
 def topic_classifiers(classifiers: list[str] | None) -> str:
@@ -90,12 +101,6 @@ def get_top_packages(limit: int = 15000) -> list[dict]:
             "The top package list came back in an unexpected format. Retry later; if it "
             "persists, the upstream dataset changed and findmypylibrary needs an update."
         ) from exc
-
-
-def _as_text(value: object) -> str:
-    if isinstance(value, (list, tuple)):
-        return ", ".join(str(v) for v in value)
-    return "" if value is None else str(value)
 
 
 async def _fetch_one(
@@ -128,15 +133,15 @@ async def _fetch_one(
             info = data.get("info") or {}
             urls = data.get("urls") or []
             return {
-                "name": info.get("name") or name,
-                "summary": _as_text(info.get("summary")),
-                "keywords": _as_text(info.get("keywords")),
+                "name": clean_text(info.get("name")) or name,
+                "summary": clean_text(info.get("summary")),
+                "keywords": clean_text(info.get("keywords")),
                 "topics": topic_classifiers(info.get("classifiers")),
                 "description": clean_description(info.get("description")),
                 "homepage": (info.get("project_urls") or {}).get("Homepage")
                 or info.get("home_page")
                 or "",
-                "version": info.get("version") or "",
+                "version": clean_text(info.get("version")),
                 "last_release": urls[0].get("upload_time_iso_8601") if urls else None,
                 "download_count": row.get("download_count") or 0,
                 "rank": rank,
@@ -198,8 +203,15 @@ def download_prebuilt_snapshot(dest_path: Path) -> None:
                         f"No prebuilt snapshot available (HTTP {resp.status_code}). {hint}"
                     )
                 try:
+                    received = 0
                     with open(gz_path, "wb") as f:
                         for chunk in resp.iter_bytes():
+                            received += len(chunk)
+                            if received > MAX_DOWNLOAD_BYTES:
+                                raise FetchError(
+                                    f"The download is larger than {MAX_DOWNLOAD_BYTES} bytes, "
+                                    f"which no real snapshot is. {hint}"
+                                )
                             f.write(chunk)
                 except OSError as exc:
                     raise FetchError(
@@ -211,7 +223,12 @@ def download_prebuilt_snapshot(dest_path: Path) -> None:
 
         try:
             with gzip.open(gz_path, "rb") as src, open(db_tmp_path, "wb") as dst:
-                shutil.copyfileobj(src, dst)
+                written = 0
+                while chunk := src.read(1024 * 1024):
+                    written += len(chunk)
+                    if written > MAX_SNAPSHOT_BYTES:
+                        raise OSError("decompressed size exceeds the snapshot size limit")
+                    dst.write(chunk)
             cache.validate_snapshot(db_tmp_path)
         except (OSError, EOFError, zlib.error, cache.SnapshotError) as exc:
             raise FetchError(f"The downloaded snapshot is invalid ({exc}). {hint}") from exc

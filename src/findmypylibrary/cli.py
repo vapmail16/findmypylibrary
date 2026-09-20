@@ -30,7 +30,8 @@ def _is_query_not_command(args: list[str]) -> bool:
     e.g. `status bar widget` or `refresh tokens oauth`."""
     command, rest = args[0], args[1:]
     if command in ("status", "golden"):
-        return bool(rest) and rest != ["--help"]
+        # Only a following word makes it a query; `status --json` is a usage error.
+        return any(not arg.startswith("-") for arg in rest)
     if command == "refresh":
         # Any positional word (one that is not --limit's value) means a query.
         positional, skip_next = [], False
@@ -76,7 +77,11 @@ def _friendly_errors(command: Callable[..., None]) -> Callable[..., None]:
 
 @click.group(
     cls=DefaultGroup,
-    context_settings={"ignore_unknown_options": True, "allow_interspersed_args": False},
+    context_settings={
+        "ignore_unknown_options": True,
+        "allow_interspersed_args": False,
+        "help_option_names": ["-h", "--help"],
+    },
 )
 @click.version_option(package_name="findmypylibrary")
 def main() -> None:
@@ -102,11 +107,17 @@ def main() -> None:
     show_default=True,
     help="With --build-locally: how many top-downloaded packages to include.",
 )
+@click.pass_context
 @_friendly_errors
-def refresh(build_locally: bool, limit: int) -> None:
+def refresh(ctx: click.Context, build_locally: bool, limit: int) -> None:
     """Get a fresh snapshot: downloads the prebuilt monthly one unless --build-locally."""
     from . import fetch
 
+    limit_given = ctx.get_parameter_source("limit") is click.core.ParameterSource.COMMANDLINE
+    if limit_given and not build_locally:
+        raise click.UsageError(
+            "--limit only applies to --build-locally; the prebuilt snapshot is always complete."
+        )
     if build_locally:
         _build_locally(limit)
     else:
@@ -165,8 +176,10 @@ def search(query: tuple[str, ...], num: int, as_json: bool) -> None:
                 "name": pkg["name"],
                 "summary": pkg["summary"],
                 "score": round(score, 4),
-                "downloads_30d": pkg["download_count"],
+                "downloads_30d": pkg["downloads_30d"],
                 "last_release": pkg["last_release"],
+                "version": pkg["version"],
+                "homepage": pkg["homepage"],
                 "url": f"https://pypi.org/project/{pkg['name']}/",
             }
             for pkg, score in results
@@ -182,7 +195,7 @@ def search(query: tuple[str, ...], num: int, as_json: bool) -> None:
         last_release = (pkg["last_release"] or "unknown")[:10]
         click.echo(f"{i}. {pkg['name']}  (score {score:.2f})")
         click.echo(f"   {pkg['summary'] or 'no summary available'}")
-        click.echo(f"   downloads/30d: {pkg['download_count']:,}  last release: {last_release}")
+        click.echo(f"   downloads/30d: {pkg['downloads_30d']:,}  last release: {last_release}")
         click.echo(f"   https://pypi.org/project/{pkg['name']}/")
 
 

@@ -25,8 +25,6 @@ jobs:
     timeout-minutes: 45
     env:
       XDG_CACHE_HOME: ${{ github.workspace }}/.cache
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      TAG: snapshot-latest
     steps:
       - uses: actions/checkout@v5
 
@@ -46,8 +44,12 @@ jobs:
         run: findmypylibrary golden
 
       - name: Publish to the fixed snapshot release
+        env:
+          # Only this step can write to the repo; the crawl above handles untrusted data.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
+          TAG="$(python -c 'from findmypylibrary import fetch; print(fetch.SNAPSHOT_TAG)')"
           ASSET="$(python -c 'from findmypylibrary import fetch; print(fetch.snapshot_asset_name())')"
           gzip -9 -c "$XDG_CACHE_HOME/findmypylibrary/snapshot.sqlite" > "$ASSET"
           # No `| head`: under pipefail a closed pipe could fail the step.

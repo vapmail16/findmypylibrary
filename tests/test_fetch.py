@@ -73,6 +73,12 @@ def test_topic_classifiers_keeps_only_topic_and_framework_values() -> None:
     assert fetch.topic_classifiers(None) == ""
 
 
+def test_text_from_pypi_has_control_characters_removed() -> None:
+    """Summaries are printed to a terminal; escape sequences must not survive the crawl."""
+    assert fetch.clean_text("Fast\x1b[31m red\x07 parser\n") == "Fast[31m red parser"
+    assert "\x1b" not in fetch.clean_description("intro \x1b]0;title\x07 text")
+
+
 # --- top package list ------------------------------------------------------
 
 
@@ -326,7 +332,7 @@ def test_download_prebuilt_snapshot_missing_release_raises() -> None:
     with pytest.raises(fetch.FetchError, match="--build-locally"):
         fetch.download_prebuilt_snapshot(cache.db_path())
 
-    assert not cache.exists()
+    assert not cache.db_path().exists()
 
 
 @respx.mock
@@ -384,3 +390,26 @@ def test_download_that_cannot_be_written_to_disk_raises_fetch_error(tmp_path: Pa
 
     with pytest.raises(fetch.FetchError, match="Could not save"):
         fetch.download_prebuilt_snapshot(unwritable)
+
+
+@respx.mock
+def test_download_larger_than_the_cap_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(fetch, "MAX_DOWNLOAD_BYTES", 100)
+    respx.get(fetch.snapshot_url()).mock(
+        return_value=httpx.Response(200, content=_gzipped_valid_snapshot())
+    )
+    with pytest.raises(fetch.FetchError, match="larger than"):
+        fetch.download_prebuilt_snapshot(cache.db_path())
+    assert not cache.db_path().exists()
+
+
+@respx.mock
+def test_download_that_decompresses_beyond_the_cap_is_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(fetch, "MAX_SNAPSHOT_BYTES", 1000)
+    respx.get(fetch.snapshot_url()).mock(
+        return_value=httpx.Response(200, content=gzip.compress(b"\0" * 5_000_000))
+    )
+    with pytest.raises(fetch.FetchError, match="invalid"):
+        fetch.download_prebuilt_snapshot(cache.db_path())

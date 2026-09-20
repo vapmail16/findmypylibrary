@@ -11,8 +11,15 @@ First functional release (0.0.1 was a name placeholder).
   keywords. README-only evidence is heavily discounted (boto3's README mentions "unit tests").
 - Stopword removal, a curated synonym list, a term-coverage gate, and a relevance /
   popularity / recency blend tuned on real data.
-- Golden-query suite: 40 everyday queries with well-known answers. 40/40 pass on the full
-  snapshot. Runs offline in tests and as a publish gate in the monthly workflow.
+- Popularity credit is scaled by how many of the query's rare, informative terms a package
+  matches, so a billion-download package matching only a common word (idna for "gui
+  application") no longer tops the list. Chosen on held-out queries and confirmed on a third,
+  fresh set (mean reciprocal rank 0.755 -> 0.858 there).
+- Listed two-word compounds count for both words ("unit testing" matches "unittest"). Compounding
+  every adjacent pair was measured and rejected (84/95 instead of 89/95).
+- Golden-query suite: 95 everyday queries with well-known answers; 90 pass on the full snapshot
+  (49 of the 55 that were never used for tuning). Runs offline in tests and as a publish gate in
+  the monthly workflow.
 
 ### Robustness
 - `refresh` downloads a prebuilt monthly snapshot from a fixed `snapshot-latest` release
@@ -44,6 +51,16 @@ First functional release (0.0.1 was a name placeholder).
   golden fixture also contains popular competitors and a random corpus sample, not only
   packages the ranker already favoured.
 - Publishing requires the tag to be on master and the matching snapshot asset to exist.
+
+### Release audit
+- `refresh --limit N` without `--build-locally` is a usage error (it used to be ignored and
+  download the full snapshot); `status --json` is a usage error, not a search for "status".
+- Public API settled: `search()` returns only public fields (`downloads_30d`, matching
+  `--json`), validates `top_n`, and `SnapshotError` / `FetchError` are exported.
+- Text from PyPI has control characters removed before it is stored (results are printed to a
+  terminal); downloads are size-capped and opened with `trusted_schema=OFF`.
+- `-h` works; Python 3.14 added to CI and classifiers; the workflow token is scoped to the
+  publishing step only.
 
 ### Process
 - CI on Linux/macOS/Windows × Python 3.10–3.13: tests with a 90% coverage gate, ruff, mypy.

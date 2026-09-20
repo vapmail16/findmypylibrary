@@ -17,16 +17,11 @@ def test_cache_dir_creates_directory() -> None:
     assert d.name == "findmypylibrary"
 
 
-def test_exists_false_before_any_save() -> None:
-    assert cache.exists() is False
-
-
 def test_save_then_info_reports_count_version_and_age() -> None:
     cache.save_packages([make_pkg("boto3", "AWS SDK"), make_pkg("requests", "HTTP for Humans")])
 
     info = cache.snapshot_info()
 
-    assert cache.exists() is True
     assert info["count"] == 2
     assert info["schema_version"] == cache.SCHEMA_VERSION
     assert info["age_days"] == 0
@@ -114,11 +109,6 @@ def test_matching_rowids_returns_ids_usable_for_coverage() -> None:
     assert len(parse_ids) == 2
     assert len(pdf_ids) == 1
     assert pdf_ids <= parse_ids
-
-
-def test_get_meta_missing_key_returns_none() -> None:
-    cache.save_packages([make_pkg("boto3")])
-    assert cache.get_meta("does-not-exist") is None
 
 
 def test_reading_missing_snapshot_raises_snapshot_error() -> None:

@@ -129,6 +129,20 @@ def test_query_starting_with_a_no_argument_command_word_is_a_search() -> None:
     assert "statusbar" in output
 
 
+def test_an_option_after_a_no_argument_command_is_a_usage_error_not_a_search() -> None:
+    """Regression: `findmypylibrary status --json` ran a search for the word "status"."""
+    cache.save_packages([make_pkg("statusbar", "status bar widget for terminals")])
+    code, output = run("status", "--json")
+    assert code == 2
+    assert "statusbar" not in output
+
+
+def test_short_help_flag_works() -> None:
+    code, output = run("-h")
+    assert code == 0
+    assert "refresh" in output
+
+
 def test_options_may_come_before_a_bare_query() -> None:
     cache.save_packages([make_pkg(f"pkg{i}", "parse pdf files", 1000 * (i + 1)) for i in range(5)])
     code, output = run("-n", "2", "parse", "pdf")
@@ -158,6 +172,16 @@ def test_json_output_is_machine_readable() -> None:
     results = json.loads(output)
     assert results[0]["name"] == "openpyxl"
     assert results[0]["downloads_30d"] == 339_316_525
+    assert set(results[0]) == {
+        "name",
+        "summary",
+        "score",
+        "downloads_30d",
+        "last_release",
+        "version",
+        "homepage",
+        "url",
+    }
     assert results[0]["url"] == "https://pypi.org/project/openpyxl/"
     assert 0.0 <= results[0]["score"] <= 1.0
 
@@ -298,6 +322,20 @@ def test_unusable_cache_directory_is_actionable(
         code, output = run(*command)
         assert code != 0
         assert "cache directory" in output
+
+
+def test_limit_without_build_locally_is_rejected_instead_of_silently_ignored(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: `refresh --limit 5` ignored --limit and downloaded the full snapshot."""
+
+    def must_not_download(dest_path: Path) -> None:
+        raise AssertionError("downloaded although the options were contradictory")
+
+    monkeypatch.setattr(fetch, "download_prebuilt_snapshot", must_not_download)
+    code, output = run("refresh", "--limit", "5")
+    assert code == 2
+    assert "--build-locally" in output
 
 
 def test_refresh_tolerates_a_few_missing_packages(monkeypatch: pytest.MonkeyPatch) -> None:

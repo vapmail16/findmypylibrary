@@ -69,10 +69,6 @@ def db_path() -> Path:
     return cache_dir() / "snapshot.sqlite"
 
 
-def exists() -> bool:
-    return db_path().exists()
-
-
 @contextmanager
 def _open_snapshot(path: Path) -> Iterator[sqlite3.Connection]:
     """Open a snapshot read-only, raising SnapshotError unless it is usable."""
@@ -88,6 +84,8 @@ def _open_snapshot(path: Path) -> Iterator[sqlite3.Connection]:
         conn.row_factory = sqlite3.Row
         try:
             conn.execute("PRAGMA query_only = ON")
+            # The file may have come from the network: no triggers/views/functions from it.
+            conn.execute("PRAGMA trusted_schema = OFF")
             row = conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
         except sqlite3.DatabaseError as exc:
             raise SnapshotError(f"The local snapshot is unreadable. {REFRESH_HINT}") from exc
@@ -214,12 +212,6 @@ def matching_ids(match_expr: str) -> set[int]:
             "SELECT rowid FROM packages_fts WHERE packages_fts MATCH ?", (match_expr,)
         ).fetchall()
     return {r[0] for r in rows}
-
-
-def get_meta(key: str) -> str | None:
-    with _open_snapshot(db_path()) as conn:
-        row = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
-    return row[0] if row else None
 
 
 def snapshot_info() -> dict:

@@ -134,6 +134,69 @@ def test_readme_noise_does_not_beat_a_real_match() -> None:
     assert "boto3" not in result
 
 
+def test_popular_package_matching_only_the_common_word_does_not_beat_a_specialist() -> None:
+    """Regression (held-out eval): 'gui application' returned idna and platformdirs, which
+    match only the very common word 'application' but have ~1000x the downloads."""
+    common = [
+        make_pkg(f"app{i}", f"helper number {i} for your application", 50_000) for i in range(40)
+    ]
+    result = names(
+        "gui application",
+        [
+            make_pkg(
+                "idna", "Internationalized Domain Names in Applications (IDNA)", 1_800_000_000
+            ),
+            make_pkg("guikit", "Cross-platform GUI application toolkit", 2_000_000),
+            *common,
+        ],
+    )
+    assert result[0] == "guikit"
+
+
+def test_graph_is_not_treated_as_a_synonym_of_chart() -> None:
+    """Regression (validation eval): 'graph algorithms' returned matplotlib, not networkx,
+    because 'graph' was expanded to 'plot' and 'chart'."""
+    assert "plot" not in rank.term_group("graph")
+    assert "chart" not in rank.term_group("graphs")
+    assert "plot" in rank.term_group("charts")
+
+
+def test_adjacent_query_words_also_match_their_compound() -> None:
+    """Regression: pytest (keywords "test, unittest") vanished from 'unit testing'."""
+    assert "unittest" in rank.term_groups(["unit", "testing"])[0]
+    assert "timezone" in rank.term_groups(["time", "zone", "conversion"])[1]
+    assert rank.term_groups(["unit"]) == [rank.term_group("unit")]
+    assert rank.term_groups(["machine", "learning"]) == [["machine"], ["learning"]]
+
+    common = [make_pkg(f"t{i}", f"testing helper number {i}", 50_000) for i in range(40)]
+    result = names(
+        "unit testing",
+        [
+            make_pkg(
+                "pytest",
+                "pytest: simple powerful testing with Python",
+                1_038_243_019,
+                keywords="test, unittest",
+            ),
+            make_pkg("kgb", "Utilities for spying on function calls in unit tests.", 150_000),
+            *common,
+        ],
+    )
+    assert result[0] == "pytest"
+
+
+def test_compound_matching_does_not_leak_into_other_queries_with_the_same_word() -> None:
+    """'unit conversion' must not pull in unittest tools just because it contains 'unit'."""
+    result = names(
+        "unit conversion",
+        [
+            make_pkg("pint", "Physical quantities module: unit conversion", 40_000_000),
+            make_pkg("pytest", "simple powerful testing", 1_038_243_019, keywords="unittest"),
+        ],
+    )
+    assert result == ["pint"]
+
+
 def test_synonym_connects_postgres_to_postgresql() -> None:
     result = names(
         "connect to postgres database",

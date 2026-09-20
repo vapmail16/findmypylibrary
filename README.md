@@ -11,7 +11,7 @@ pip install findmypylibrary
 ## Use
 
 ```bash
-findmypylibrary refresh              # one-time, a few seconds: downloads this month's snapshot (~11 MB)
+findmypylibrary refresh              # first run, then monthly: downloads the latest snapshot (~11 MB)
 findmypylibrary "resize images"      # instant, offline, ranked results
 findmypylibrary "parse pdf files" -n 5 --json   # machine-readable output
 findmypylibrary status               # how many packages, how old is the snapshot
@@ -26,8 +26,13 @@ From Python:
 import findmypylibrary
 
 for package, score in findmypylibrary.search("parse pdf files", top_n=5):
-    print(package["name"], package["download_count"], round(score, 2))
+    print(package["name"], package["downloads_30d"], round(score, 2))
 ```
+
+`search()` returns `(package, score)` pairs, best first. `package` is a dict with `name`,
+`summary`, `keywords`, `topics`, `homepage`, `version`, `last_release` and `downloads_30d`;
+`score` is 0–1 and only comparable within one query. It raises `findmypylibrary.SnapshotError`
+when there is no usable snapshot (run `findmypylibrary refresh`) and `ValueError` for `top_n < 1`.
 
 ## Where the data comes from
 
@@ -61,16 +66,24 @@ Fully offline and lexical — no model, no embeddings.
 2. **Rank.** Survivors are ordered by a blend of relevance, 30-day downloads and how recently
    the package was released.
 
-Known limits, measured on the real snapshot (40/40 golden queries pass; these are the edges):
+How good is it? Measured on the real snapshot with 95 everyday queries that each have a
+well-known right answer: 90 put one in the top 5 (95%). That number is flattering, because 40 of
+the queries were used to tune the ranking. On the 55 queries written afterwards, with the
+expected answers fixed before looking at any result, it was 49 of 55 (89%). Expect roughly nine
+searches in ten to show a package you would recognise as right.
+
+Known limits:
 
 - Matching is lexical. A package is found only if its own metadata or README intro uses your
   words, a stem of them, or a listed synonym. pandas never says "dataframe" in its metadata, so
-  "dataframes" returns polars and narwhals, while "data analysis" returns pandas first.
+  "dataframes" returns polars and narwhals, while "data analysis" returns pandas first. numpy
+  does not appear for "linear algebra", nor boto3 for "upload files to s3".
 - README-only matches are discounted on purpose. Raising them enough to surface pandas for
   "dataframes" also surfaces boto3 for "unit testing" (its README says "run the unit tests");
   the two are indistinguishable lexically, so precision wins.
-- Very common query words ("data", "web", "file") let a few popular but loosely related
-  packages into the lower half of the results.
+- A package earns popularity credit only for the rare, informative words of your query that
+  it matches. Without that, idna and platformdirs (over a billion downloads each) top
+  "gui application" by matching only "application".
 
 ## Development
 
@@ -83,11 +96,12 @@ mypy src
 findmypylibrary golden      # ranking quality check against your local snapshot
 ```
 
-`src/findmypylibrary/golden_queries.json` holds everyday queries with well-known right answers.
+`src/findmypylibrary/golden_queries.json` holds 95 everyday queries with well-known right answers.
 The test suite runs them offline against a committed slice of the real corpus
 (`tests/fixtures/golden_corpus.json.gz`, rebuilt with `python scripts/build_golden_fixture.py`);
 the monthly workflow runs them against the full snapshot before publishing. Add a query there
-first whenever you change ranking.
+first whenever you change ranking, and judge a ranking change on *new* queries whose expected
+answers you wrote down before running them: every query already in the file has been tuned on.
 
 If you change the snapshot tables, bump `SCHEMA_VERSION` in `cache.py`: the snapshot file name
 carries it, so older installs keep downloading a layout they understand.
